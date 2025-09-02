@@ -175,7 +175,7 @@ def main(args: Args):
     if record_dir:
         record_dir = record_dir.format(env_id=env_id)
         env = RecordEpisodeMA(env, record_dir, info_on_video=False, save_trajectory=False, max_steps_per_video=30000)
-    raw_obs, _ = env.reset(seed=args.seed)
+    raw_obs, _ = env.reset(seed=args.seed[0])
     planner = PandaArmMotionPlanningSolver(
         env,
         debug=False,
