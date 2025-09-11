@@ -9,10 +9,9 @@ def main():
     command = (
         f"python -m robofactory.planner.run "
         f"-c \"{args.config}\" " 
-        f"--render-mode=\"human\" "
+        f"--render-mode=\"rgb_array\" "
         f"-b=\"cpu\" "
         f"-n 1 "
-        f"--vis"
     )
 
     os.system(command)
