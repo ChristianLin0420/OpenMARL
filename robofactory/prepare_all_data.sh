@@ -22,18 +22,55 @@ log() {
     echo -e "$1" | tee -a "$LOG_FILE"
 }
 
+# Get the number of agents for a task from config file
+get_agent_count() {
+    local task_name="$1"
+    
+    # Convert task name to config file name
+    local base_name=$(echo "$task_name" | sed 's/-rf$//' | sed 's/\([A-Z]\)/_\1/g' | sed 's/^_//' | tr '[:upper:]' '[:lower:]')
+    
+    # Try table config first
+    local table_config="configs/table/${base_name}.yaml"
+    if [ -f "$table_config" ]; then
+        local agent_count=$(grep -c "robot_uid:" "$table_config" 2>/dev/null || echo "0")
+        echo "$agent_count"
+        return 0
+    fi
+    
+    # Try robocasa config
+    local robocasa_config="configs/robocasa/${base_name}.yaml"
+    if [ -f "$robocasa_config" ]; then
+        local agent_count=$(grep -c "robot_uid:" "$robocasa_config" 2>/dev/null || echo "0")
+        echo "$agent_count"
+        return 0
+    fi
+    
+    # If not found, return 0
+    echo "0"
+    return 1
+}
+
 # Check if task is already prepared
 is_task_prepared() {
     local task_name="$1"
     local scene_type="$2"
     
-    # Check if zarr data exists for both agents
-    if [ -d "data/zarr_data/${task_name}_Agent0_${NUM_EPISODES}.zarr" ] && \
-       [ -d "data/zarr_data/${task_name}_Agent1_${NUM_EPISODES}.zarr" ]; then
-        return 0  # Task is prepared
-    else
-        return 1  # Task is not prepared
+    # Get the number of agents for this task
+    local agent_count=$(get_agent_count "$task_name")
+    
+    if [ "$agent_count" -eq 0 ]; then
+        return 1  # No agents found
     fi
+    
+    # Check if zarr data exists for all agents
+    for ((i=0; i<agent_count; i++)); do
+        local zarr_path="data/zarr_data/${task_name}_Agent${i}_${NUM_EPISODES}.zarr"
+        if [ ! -d "$zarr_path" ]; then
+            return 1  # Missing dataset for agent i
+        fi
+    done
+    
+    return 0  # All datasets are available
 }
 
 # Get task name from config file
@@ -89,10 +126,20 @@ prepare_task_data() {
         return 1
     fi
     
+    # Get the number of agents for this task
+    local agent_count=$(get_agent_count "$task_name")
+    
+    if [ "$agent_count" -eq 0 ]; then
+        log "${RED}  ✗ No agents found for $task_name, skipping...${NC}"
+        return 1
+    fi
+    
+    log "  Found $agent_count agents for this task"
+    
     # Step 3: Convert h5 to pkl
     log "  Step 3/4: Converting h5 to pkl..."
-    if python script/parse_h5_to_pkl_multi.py --task_name "$task_name" --load_num $NUM_EPISODES --agent_num 2; then
-        log "  ✓ H5 to PKL conversion completed"
+    if python script/parse_h5_to_pkl_multi.py --task_name "$task_name" --load_num $NUM_EPISODES --agent_num $agent_count; then
+        log "  ✓ H5 to PKL conversion completed for $agent_count agents"
     else
         log "${RED}  ✗ H5 to PKL conversion failed for $task_name${NC}"
         return 1
@@ -100,7 +147,7 @@ prepare_task_data() {
     
     # Step 4: Convert pkl to zarr
     log "  Step 4/4: Converting pkl to zarr..."
-    for agent_id in 0 1; do
+    for ((agent_id=0; agent_id<agent_count; agent_id++)); do
         if python script/parse_pkl_to_zarr_dp.py --task_name "$task_name" --load_num $NUM_EPISODES --agent_id $agent_id; then
             log "  ✓ PKL to ZARR conversion completed for Agent $agent_id"
         else

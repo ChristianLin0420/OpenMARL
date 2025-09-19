@@ -29,12 +29,11 @@ is_task_trained() {
     local task_name="$1"
     local agent_id="$2"
     
-    # Check if checkpoint exists for both agents
-    if [ -f "checkpoints/${task_name}_Agent0_${NUM_EPISODES}/${EPOCHS}.ckpt" ] && \
-       [ -f "checkpoints/${task_name}_Agent1_${NUM_EPISODES}/${EPOCHS}.ckpt" ]; then
-        return 0  # Task is trained
+    # Check if checkpoint exists for the specific agent
+    if [ -f "checkpoints/${task_name}_Agent${agent_id}_${NUM_EPISODES}/${EPOCHS}.ckpt" ]; then
+        return 0  # Agent is trained
     else
-        return 1  # Task is not trained
+        return 1  # Agent is not trained
     fi
 }
 
@@ -42,13 +41,50 @@ is_task_trained() {
 is_dataset_available() {
     local task_name="$1"
     
-    # Check if zarr data exists for both agents
-    if [ -d "data/zarr_data/${task_name}_Agent0_${NUM_EPISODES}.zarr" ] && \
-       [ -d "data/zarr_data/${task_name}_Agent1_${NUM_EPISODES}.zarr" ]; then
-        return 0  # Dataset is available
-    else
-        return 1  # Dataset is not available
+    # Get the number of agents for this task
+    local agent_count=$(get_agent_count "$task_name")
+    
+    if [ "$agent_count" -eq 0 ]; then
+        return 1  # No agents found
     fi
+    
+    # Check if zarr data exists for all agents
+    for ((i=0; i<agent_count; i++)); do
+        local zarr_path="data/zarr_data/${task_name}_Agent${i}_${NUM_EPISODES}.zarr"
+        if [ ! -d "$zarr_path" ]; then
+            return 1  # Missing dataset for agent i
+        fi
+    done
+    
+    return 0  # All datasets are available
+}
+
+# Get the number of agents for a task from config file
+get_agent_count() {
+    local task_name="$1"
+    
+    # Convert task name to config file name
+    local base_name=$(echo "$task_name" | sed 's/-rf$//' | sed 's/\([A-Z]\)/_\1/g' | sed 's/^_//' | tr '[:upper:]' '[:lower:]')
+    
+    # Try table config first
+    local table_config="configs/table/${base_name}.yaml"
+    if [ -f "$table_config" ]; then
+        local agent_count=$(grep -c "robot_uid:" "$table_config" 2>/dev/null || echo "0")
+        echo "$agent_count"
+        return 0
+    fi
+    
+    # Try robocasa config
+    local robocasa_config="configs/robocasa/${base_name}.yaml"
+    if [ -f "$robocasa_config" ]; then
+        local agent_count=$(grep -c "robot_uid:" "$robocasa_config" 2>/dev/null || echo "0")
+        echo "$agent_count"
+        return 0
+    fi
+    
+    # If not found, return 0
+    echo "0"
+    return 1
 }
 
 # Train a single task
@@ -57,9 +93,27 @@ train_task() {
     
     log "${BLUE}Training task: $task_name${NC}"
     
-    # Check if already trained
-    if is_task_trained "$task_name" "0"; then
-        log "${GREEN}✓ Task $task_name is already trained, skipping...${NC}"
+    # Get the number of agents for this task
+    local agent_count=$(get_agent_count "$task_name")
+    
+    if [ "$agent_count" -eq 0 ]; then
+        log "${RED}✗ No agents found for $task_name, skipping...${NC}"
+        return 1
+    fi
+    
+    log "  Found $agent_count agents for this task"
+    
+    # Check if already trained (check all agents)
+    local all_trained=true
+    for ((i=0; i<agent_count; i++)); do
+        if ! is_task_trained "$task_name" "$i"; then
+            all_trained=false
+            break
+        fi
+    done
+    
+    if [ "$all_trained" = true ]; then
+        log "${GREEN}✓ Task $task_name is already trained for all agents, skipping...${NC}"
         return 0
     fi
     
@@ -69,27 +123,20 @@ train_task() {
         return 1
     fi
     
-    log "${YELLOW}→ Starting training for $task_name...${NC}"
+    log "${YELLOW}→ Starting training for $task_name with $agent_count agents...${NC}"
     
-    # Train Agent 0
-    log "  Training Agent 0..."
-    if bash policy/Diffusion-Policy/train.sh "$task_name" $NUM_EPISODES 0 $SEED $GPU_ID; then
-        log "  ✓ Agent 0 training completed"
-    else
-        log "${RED}  ✗ Agent 0 training failed for $task_name${NC}"
-        return 1
-    fi
+    # Train all agents
+    for ((i=0; i<agent_count; i++)); do
+        log "  Training Agent $i..."
+        if bash policy/Diffusion-Policy/train.sh "$task_name" $NUM_EPISODES $i $SEED $GPU_ID; then
+            log "  ✓ Agent $i training completed"
+        else
+            log "${RED}  ✗ Agent $i training failed for $task_name${NC}"
+            return 1
+        fi
+    done
     
-    # Train Agent 1
-    log "  Training Agent 1..."
-    if bash policy/Diffusion-Policy/train.sh "$task_name" $NUM_EPISODES 1 $SEED $GPU_ID; then
-        log "  ✓ Agent 1 training completed"
-    else
-        log "${RED}  ✗ Agent 1 training failed for $task_name${NC}"
-        return 1
-    fi
-    
-    log "${GREEN}✓ Task $task_name training completed successfully!${NC}"
+    log "${GREEN}✓ Task $task_name training completed successfully for all $agent_count agents!${NC}"
     return 0
 }
 
