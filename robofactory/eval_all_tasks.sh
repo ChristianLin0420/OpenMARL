@@ -45,17 +45,42 @@ log "  - Debug mode: $DEBUG_MODE"
 log "  - Results directory: $RESULTS_DIR"
 log "${BLUE}========================================${NC}"
 
+# Get all agents for a task
+get_task_agents() {
+    local task_name="$1"
+    local agents=()
+    
+    # Find all agent directories for this task
+    for agent_dir in checkpoints/${task_name}_Agent*_${NUM_EPISODES}; do
+        if [ -d "$agent_dir" ]; then
+            local agent_name=$(basename "$agent_dir" | sed "s/${task_name}_//" | sed "s/_${NUM_EPISODES}$//")
+            agents+=("$agent_name")
+        fi
+    done
+    
+    # Sort agents by number for consistent ordering
+    printf '%s\n' "${agents[@]}" | sort -V
+}
+
 # Check if task is trained and ready for evaluation
 is_task_ready() {
     local task_name="$1"
     
-    # Check if checkpoints exist for both agents
-    if [ -f "checkpoints/${task_name}_Agent0_${NUM_EPISODES}/${CHECKPOINT_EPOCH}.ckpt" ] && \
-       [ -f "checkpoints/${task_name}_Agent1_${NUM_EPISODES}/${CHECKPOINT_EPOCH}.ckpt" ]; then
-        return 0  # Task is ready
-    else
-        return 1  # Task is not ready
+    # Get all agents for this task
+    local agents=($(get_task_agents "$task_name"))
+    
+    if [ ${#agents[@]} -eq 0 ]; then
+        return 1  # No agents found
     fi
+    
+    # Check if checkpoints exist for all agents
+    for agent in "${agents[@]}"; do
+        if [ ! -f "checkpoints/${task_name}_${agent}_${NUM_EPISODES}/${CHECKPOINT_EPOCH}.ckpt" ]; then
+            return 1  # Missing checkpoint for this agent
+        fi
+    done
+    
+    return 0  # All agents have checkpoints
 }
 
 # Get config file for a task
@@ -98,6 +123,10 @@ evaluate_task() {
         return 1
     fi
     
+    # Get and display agent information
+    local agents=($(get_task_agents "$task_name"))
+    log "${YELLOW}→ Task has ${#agents[@]} agents: ${agents[*]}${NC}"
+    
     log "${YELLOW}→ Starting evaluation for $task_name...${NC}"
     
     # Create task-specific log file
@@ -127,14 +156,24 @@ evaluate_task() {
 # Get all available trained tasks
 get_available_tasks() {
     local tasks=()
+    local processed_tasks=()
+    
+    # Find all task directories by looking for Agent0 directories
     for checkpoint_dir in checkpoints/*_Agent0_${NUM_EPISODES}; do
         if [ -d "$checkpoint_dir" ]; then
             local task_name=$(basename "$checkpoint_dir" | sed "s/_Agent0_${NUM_EPISODES}$//")
-            if is_task_ready "$task_name"; then
-                tasks+=("$task_name")
+            
+            # Avoid processing the same task multiple times
+            if [[ ! " ${processed_tasks[@]} " =~ " ${task_name} " ]]; then
+                processed_tasks+=("$task_name")
+                
+                if is_task_ready "$task_name"; then
+                    tasks+=("$task_name")
+                fi
             fi
         fi
     done
+    
     echo "${tasks[@]}"
 }
 
@@ -153,6 +192,10 @@ generate_summary() {
         if [ -d "$task_dir" ]; then
             local task_name=$(basename "$task_dir")
             echo "Task: $task_name" >> "$summary_file"
+            
+            # Get agent information
+            local agents=($(get_task_agents "$task_name"))
+            echo "  Agents: ${#agents[@]} (${agents[*]})" >> "$summary_file"
             
             # Find the latest log file for this task
             local latest_log=$(find "$task_dir" -name "eval_results_*.log" -type f -printf '%T@ %p\n' | sort -n | tail -1 | cut -d' ' -f2-)
@@ -203,7 +246,8 @@ main() {
     
     log "${BLUE}Found ${#available_tasks[@]} trained tasks:${NC}"
     for task in "${available_tasks[@]}"; do
-        log "  - $task"
+        local agents=($(get_task_agents "$task"))
+        log "  - $task (${#agents[@]} agents: ${agents[*]})"
     done
     log ""
     
