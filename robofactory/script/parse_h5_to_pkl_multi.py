@@ -65,8 +65,14 @@ class ManiSkillTrajectoryDataset(Dataset):
             trajectory = self.data[f"traj_{eps['episode_id']}"]
             trajectory = load_h5_data(trajectory)
 
-            # bad code!!! but useful now
-            eps_len = len(trajectory["actions"]['panda-0'])
+            # Handle both dict (multi-agent) and array (single-agent) action structures
+            if isinstance(trajectory["actions"], dict):
+                # Multi-agent case: actions is a dict with agent keys
+                first_agent_key = list(trajectory["actions"].keys())[0]
+                eps_len = len(trajectory["actions"][first_agent_key])
+            else:
+                # Single-agent case: actions is directly an array
+                eps_len = len(trajectory["actions"])
 
             # exclude the final observation as most learning workflows do not use it
             obs = common.index_dict_array(trajectory["obs"], slice(eps_len))
@@ -177,11 +183,17 @@ def main(load_num, task_name, agent_num):
             # for every episode, make a dir to save the episode data
             episode_dir = f"{base_dir}/episode{i}"
             os.makedirs(episode_dir, exist_ok=True)
-            if (len(res["action"]["panda-0"]) != len(res["obs"]["sensor_data"][camera_name]["rgb"])):
+            # Get action length - handle both dict and array structures
+            if isinstance(res["action"], dict):
+                action_len = len(res["action"]["panda-0"])
+            else:
+                action_len = len(res["action"])
+            
+            if (action_len != len(res["obs"]["sensor_data"][camera_name]["rgb"])):
                 print("action length not equal to obs length")
-                print("action length", len(res["action"]["panda-0"]))
+                print("action length", action_len)
                 print("obs length", len(res["obs"]["sensor_data"][camera_name]["rgb"]))
-            min_len = min(len(res["action"]["panda-0"]), len(res["obs"]["sensor_data"][camera_name]["rgb"]))
+            min_len = min(action_len, len(res["obs"]["sensor_data"][camera_name]["rgb"]))
             for j in range(min_len):
                 obs_dict = {}
                 obs_dict["head_camera"] = {}
@@ -197,10 +209,17 @@ def main(load_num, task_name, agent_num):
                         observation=obs_dict,
                     )
                 else:
+                    # Get action for this agent - handle both dict and array structures
+                    if isinstance(res["action"], dict):
+                        agent_action = res["action"][f'panda-{agent_id}'][j]
+                    else:
+                        # For single-agent, use the action directly
+                        agent_action = res["action"][j]
+                    
                     step_data = dict(
                         pointcloud=None,
-                        joint_action=res["action"][f'panda-{agent_id}'][j],
-                        endpose=res["action"][f'panda-{agent_id}'][j],
+                        joint_action=agent_action,
+                        endpose=agent_action,
                         observation=obs_dict,
                     )
                 with open(f"{episode_dir}/{j}.pkl", "wb") as f:

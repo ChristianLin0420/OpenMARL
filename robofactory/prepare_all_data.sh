@@ -169,7 +169,12 @@ main() {
     log "Scene types: ${SCENE_TYPES[*]}"
     log "Log file: $LOG_FILE"
     log ""
-    
+
+    # Download assets
+    log "Downloading assets..."
+    python script/download_assets.py
+    log "Assets downloaded successfully"
+
     # Ensure data directories exist
     log "Creating data directories..."
     mkdir -p data/{h5_data,pkl_data,zarr_data}

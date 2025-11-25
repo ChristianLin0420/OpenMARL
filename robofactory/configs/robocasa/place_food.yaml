@@ -5,7 +5,7 @@ scene:
     scene_idx: 0
     layout_idx: 3  # 0-9
     style_idx: 3  # 0-11
-    customized_layout: ${CONFIG_DIR}/robocasa/customized_layout.yaml 
+    customized_layout: ${CONFIG_DIR}/robocasa/layouts/customized_layout.yaml 
 
 objects:
   -
