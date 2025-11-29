@@ -1,0 +1,34 @@
+# OpenVLA Integration Requirements
+# Additional packages required for OpenVLA training and evaluation
+
+# Core OpenVLA dependencies
+transformers==4.40.1
+peft==0.11.1
+accelerate>=0.20.0
+timm==0.9.10
+tokenizers==0.19.1
+
+# Flash Attention (optional, but recommended for faster training)
+# Install with: pip install flash-attn==2.5.5 --no-build-isolation
+# flash-attn==2.5.5
+
+# RLDS dataset support
+tensorflow==2.15.0
+tensorflow-datasets==4.9.3
+dlimp @ git+https://github.com/kvablack/dlimp.git
+
+# Image processing
+Pillow>=9.0.0
+
+# Utilities
+tqdm>=4.65.0
+wandb>=0.15.0
+omegaconf>=2.3.0
+hydra-core>=1.3.2
+
+# Already in base requirements but listed for clarity
+# torch==2.6.0
+# torchvision==0.21.0
+# numpy
+# pyyaml
+

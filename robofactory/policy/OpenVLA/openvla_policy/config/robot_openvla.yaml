@@ -1,0 +1,82 @@
+defaults:
+  - _self_
+  - task: default_task
+
+name: openvla_${task.name}
+_target_: openvla_policy.workspace.openvla_workspace.OpenVLAWorkspace
+
+task_name: ${task.name}
+exp_name: "openvla"
+
+# Model configuration
+model:
+  model_name: "openvla/openvla-7b"
+  use_lora: True
+  lora_rank: 32
+  lora_alpha: 64
+  lora_dropout: 0.0
+  torch_dtype: "bfloat16"  # bfloat16, float16, or float32
+  image_size: 224
+
+# Training configuration
+training:
+  device: "cuda:0"
+  seed: 42
+  num_epochs: 300
+  learning_rate: 5.0e-4
+  min_learning_rate: 1.0e-6
+  weight_decay: 1.0e-6
+  adam_beta1: 0.9
+  adam_beta2: 0.999
+  adam_eps: 1.0e-8
+  max_grad_norm: 1.0
+  gradient_accumulate_every: 1
+  use_scheduler: True
+  
+  # Image augmentation
+  image_aug: True
+  augment_crop_ratio: 0.9  # Take 90% center/random crop
+  
+  # Validation
+  val_split: 0.1
+  val_every: 10
+  
+  # Checkpointing
+  checkpoint_every: 50
+  resume: True
+  
+  # Debug mode
+  debug: False
+  max_train_steps: 10
+  max_val_steps: 5
+
+# Dataloader configuration
+dataloader:
+  batch_size: 16
+  num_workers: 4
+  shuffle: True
+  pin_memory: True
+
+val_dataloader:
+  batch_size: 16
+  num_workers: 4
+  shuffle: False
+  pin_memory: True
+
+# Logging configuration
+logging:
+  project: "robofactory_openvla"
+  mode: "online"  # online, offline, or disabled
+  name: "${now:%Y.%m.%d-%H.%M.%S}_${name}_${task_name}"
+  tags: ["${name}", "${task_name}", "${exp_name}"]
+
+# Hydra configuration
+hydra:
+  job:
+    override_dirname: ${name}
+  run:
+    dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
+  sweep:
+    dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
+    subdir: ${hydra.job.num}
+

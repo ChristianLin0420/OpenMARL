@@ -58,3 +58,5 @@ imgui.ini
 htmlcov/
 
 !robofactory/assets/.gitkeep
+
+outputs/
