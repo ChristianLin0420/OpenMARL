@@ -42,7 +42,7 @@ OpenVLA is a vision-language-action model that can be fine-tuned on robotic mani
 - **Model**: OpenVLA-7B from HuggingFace (`openvla/openvla-7b`)
 - **Fine-tuning**: LoRA (rank=32) without quantization
 - **Precision**: BFloat16 for optimal performance
-- **Action Space**: 7-DoF (6 joint angles + 1 gripper)
+- **Action Space**: 8-DoF (7 joint positions + 1 gripper controls)
 - **Vision**: Single head camera input (224x224)
 - **Language**: Task-specific instructions per agent
 - **Training**: Multi-GPU support via PyTorch DDP
@@ -88,6 +88,290 @@ If needed, upgrade:
 ```bash
 pip install --upgrade torch==2.6.0 torchvision==0.21.0
 ```
+
+---
+
+## 🐳 Docker Usage
+
+### Build Docker Image
+
+```bash
+cd /localhome/local-chrislin/OpenMARL
+
+# Build the Docker image
+docker build -t openmarl/openvla:latest \
+    -f robofactory/policy/OpenVLA/Dockerfile .
+
+# (Optional) Tag the image for your registry (e.g., Docker Hub)
+docker tag openmarl/openvla:latest yourusername/openvla:latest
+
+# (Optional) Push the image to your registry
+docker push yourusername/openvla:latest
+
+# Run the built container
+docker run --gpus all -it --rm \
+    --name openvla-container \
+    -v $(pwd):/workspace/OpenMARL \
+    -v ~/.cache/huggingface:/root/.cache/huggingface \
+    -e WANDB_API_KEY=$WANDB_API_KEY \
+    openmarl/openvla:latest
+```
+
+### Run Training in Docker
+
+#### Single GPU Training
+
+```bash
+# Start container
+docker run --gpus '"device=0"' -it --rm \
+    --name openvla-train \
+    --shm-size=16g \
+    -v $(pwd):/workspace/OpenMARL \
+    -v ~/.cache/huggingface:/root/.cache/huggingface \
+    -e WANDB_API_KEY=$WANDB_API_KEY \
+    openmarl/openvla:latest
+
+# Inside container: Convert data (first time only)
+python robofactory/policy/OpenVLA/openvla_policy/utils/data_conversion.py \
+    --zarr_path robofactory/data/zarr_data \
+    --output_dir robofactory/data/rlds_data \
+    --batch
+
+# Inside container: Start training
+bash robofactory/policy/OpenVLA/train.sh LiftBarrier-rf 150 0 100 0
+```
+
+#### Multi-GPU Training (8 GPUs)
+
+```bash
+# Start container with all GPUs
+docker run --gpus all -it --rm \
+    --name openvla-train-multi \
+    --shm-size=32g \
+    --ipc=host \
+    -v $(pwd):/workspace/OpenMARL \
+    -v ~/.cache/huggingface:/root/.cache/huggingface \
+    -e WANDB_API_KEY=$WANDB_API_KEY \
+    -e CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+    -e MASTER_ADDR=localhost \
+    -e MASTER_PORT=29500 \
+    openmarl/openvla:latest
+
+# Inside container: Multi-GPU training
+torchrun --standalone --nnodes=1 --nproc-per-node=8 \
+    robofactory/policy/OpenVLA/train.py \
+    --config-name=robot_openvla.yaml \
+    task.name=LiftBarrier-rf \
+    task.dataset.rlds_path=data/rlds_data/LiftBarrier-rf_Agent0_150 \
+    training.seed=100 \
+    dataloader.batch_size=8
+```
+
+#### Background Training
+
+Run training in detached mode:
+
+```bash
+# Start container in background
+docker run --gpus '"device=0"' -d \
+    --name openvla-train \
+    --shm-size=16g \
+    -v $(pwd)/data:/workspace/OpenMARL/data \
+    -v $(pwd)/checkpoints:/workspace/OpenMARL/checkpoints \
+    -v $(pwd)/logs:/workspace/OpenMARL/logs \
+    -v ~/.cache/huggingface:/root/.cache/huggingface \
+    -e WANDB_API_KEY=$WANDB_API_KEY \
+    openmarl/openvla:latest \
+    bash -c "cd /workspace/OpenMARL && bash robofactory/policy/OpenVLA/train.sh LiftBarrier-rf 150 0 100 0"
+
+# Monitor logs
+docker logs -f openvla-train
+
+# Stop training
+docker stop openvla-train
+```
+
+### Docker Volume Management
+
+The Docker setup mounts the following directories:
+
+| Host Path | Container Path | Purpose |
+|-----------|----------------|---------|
+| `./data` | `/workspace/OpenMARL/data` | ZARR and RLDS datasets |
+| `./checkpoints` | `/workspace/OpenMARL/checkpoints` | Model checkpoints |
+| `./logs` | `/workspace/OpenMARL/logs` | Training logs |
+| `~/.cache/huggingface` | `/root/.cache/huggingface` | HuggingFace model cache |
+
+**Important**: Always mount volumes to preserve data between container runs!
+
+### Docker Performance Tips
+
+1. **Increase Shared Memory**: Use `--shm-size=32g` for multi-GPU training
+2. **Use IPC Host Mode**: Add `--ipc=host` for better inter-process communication
+3. **Pin CPUs** (optional): `--cpuset-cpus="0-31"` to dedicate CPU cores
+4. **Cache Models**: Mount HuggingFace cache to avoid re-downloading models
+
+### Docker Troubleshooting
+
+#### Issue: CUDA not available in container
+
+**Solution**:
+```bash
+# Verify NVIDIA runtime
+docker run --rm --gpus all nvidia/cuda:12.4.0-base-ubuntu22.04 nvidia-smi
+
+# Check Docker daemon config
+cat /etc/docker/daemon.json
+# Should include:
+{
+    "runtimes": {
+        "nvidia": {
+            "path": "nvidia-container-runtime",
+            "runtimeArgs": []
+        }
+    }
+}
+```
+
+#### Issue: Out of memory in DataLoader
+
+**Solution**: Increase shared memory
+```bash
+docker run --shm-size=32g ...
+```
+
+#### Issue: Permission denied on mounted volumes
+
+**Solution**: Run with user permissions
+```bash
+docker run --user $(id -u):$(id -g) \
+    -v $(pwd)/data:/workspace/OpenMARL/data \
+    ...
+```
+
+#### Issue: Container exits immediately
+
+**Check logs**:
+```bash
+docker logs openvla-train
+```
+
+### Pre-built Image Sharing
+
+If you want to share the Docker image:
+
+```bash
+# Save image
+docker save openmarl/openvla:latest | gzip > openvla-docker.tar.gz
+
+# Load on another machine
+gunzip -c openvla-docker.tar.gz | docker load
+
+# Or push to Docker Hub
+docker tag openmarl/openvla:latest your-dockerhub-username/openvla:latest
+docker login
+docker push your-dockerhub-username/openvla:latest
+```
+
+### Quick Docker Commands Reference
+
+```bash
+# Build image
+docker build -t openmarl/openvla:latest -f robofactory/policy/OpenVLA/Dockerfile .
+
+# Run interactive
+docker run --gpus '"device=0"' -it --rm --shm-size=16g \
+    -v $(pwd)/data:/workspace/OpenMARL/data \
+    openmarl/openvla:latest
+
+# Run in background
+docker run --gpus '"device=0"' -d --name openvla-train --shm-size=16g \
+    -v $(pwd)/data:/workspace/OpenMARL/data \
+    openmarl/openvla:latest \
+    bash -c "cd /workspace/OpenMARL && bash robofactory/policy/OpenVLA/train.sh LiftBarrier-rf 150 0 100 0"
+
+# Monitor logs
+docker logs -f openvla-train
+
+# Enter running container
+docker exec -it openvla-train bash
+
+# Stop container
+docker stop openvla-train
+
+# Remove container
+docker rm openvla-train
+
+# List all containers
+docker ps -a
+
+# Remove all stopped containers
+docker container prune
+```
+
+### Docker Image Details
+
+- **Base Image**: `pytorch/pytorch:2.6.0-cuda12.4-cudnn9-devel`
+- **PyTorch Version**: 2.6.0
+- **CUDA Version**: 12.4
+- **cuDNN Version**: 9
+- **Python Version**: 3.10
+- **Image Size**: ~15-20 GB
+- **Build Time**: ~10-15 minutes
+
+**Installation Order** (follows main README.md):
+1. Install OpenMARL base package: `pip install -e .`
+2. Install robofactory requirements: `pip install -r robofactory/requirements.txt`
+3. Install OpenVLA-specific requirements: `pip install -r robofactory/policy/OpenVLA/requirements.txt`
+4. Install Flash Attention (optional): `pip install flash-attn==2.5.5`
+
+**Key Installed Packages**:
+- Base: `mani_skill==3.0.0b12`, `torch==2.6.0`, `zarr==2.18.2`, `hydra-core==1.3.2`
+- OpenVLA: `transformers==4.40.1`, `peft==0.11.1`, `tensorflow==2.15.0`, `wandb>=0.15.0`
+- Optional: `flash-attn==2.5.5` (for faster training if GPU supports it)
+
+See `robofactory/requirements.txt` and `robofactory/policy/OpenVLA/requirements.txt` for complete lists.
+
+### Docker Advanced Usage
+
+#### Multi-Node Training
+
+For distributed training across multiple machines:
+
+```bash
+# On master node (192.168.1.100)
+docker run --gpus all --network=host \
+    -v $(pwd)/data:/workspace/OpenMARL/data \
+    -v $(pwd)/checkpoints:/workspace/OpenMARL/checkpoints \
+    -e MASTER_ADDR=192.168.1.100 \
+    -e MASTER_PORT=29500 \
+    -e NODE_RANK=0 \
+    -e WORLD_SIZE=2 \
+    openmarl/openvla:latest \
+    bash -c "torchrun --nnodes=2 --node-rank=0 --master-addr=192.168.1.100 --master-port=29500 \
+        robofactory/policy/OpenVLA/train.py --config-name=robot_openvla.yaml \
+        task.name=LiftBarrier-rf task.dataset.rlds_path=data/rlds_data/LiftBarrier-rf_Agent0_150"
+
+# On worker node (192.168.1.101)
+docker run --gpus all --network=host \
+    -v $(pwd)/data:/workspace/OpenMARL/data \
+    -v $(pwd)/checkpoints:/workspace/OpenMARL/checkpoints \
+    -e MASTER_ADDR=192.168.1.100 \
+    -e MASTER_PORT=29500 \
+    -e NODE_RANK=1 \
+    -e WORLD_SIZE=2 \
+    openmarl/openvla:latest \
+    bash -c "torchrun --nnodes=2 --node-rank=1 --master-addr=192.168.1.100 --master-port=29500 \
+        robofactory/policy/OpenVLA/train.py --config-name=robot_openvla.yaml \
+        task.name=LiftBarrier-rf task.dataset.rlds_path=data/rlds_data/LiftBarrier-rf_Agent0_150"
+```
+
+#### Performance Notes
+
+- **Single GPU**: ~29 min/epoch (batch size 16)
+- **8 GPUs**: ~4-5 min/epoch (batch size 8 per GPU)
+- **Docker Overhead**: <5%
+- **Recommended Shared Memory**: 16GB (single GPU), 32GB (multi-GPU)
 
 ---
 
@@ -663,7 +947,7 @@ python robofactory/policy/OpenVLA/test_pipeline.py --test_model
 3. **RLDS Format**: Native OpenVLA dataset format for compatibility
 4. **LoRA Only**: Parameter-efficient fine-tuning (1.05% params)
 5. **Single Image**: Head camera only (can extend to multi-camera)
-6. **Action Space**: 7-DoF (6 joints + 1 gripper)
+6. **Action Space**: 8-dimensional (7 joint positions + 1 gripper)
 
 ### Differences from Diffusion Policy
 
@@ -741,6 +1025,8 @@ If you use this code, please cite both OpenVLA and RoboFactory:
 
 ## Quick Reference Commands
 
+### Native (Conda) Environment
+
 ```bash
 # 1. Activate environment
 conda activate marlvla
@@ -766,6 +1052,36 @@ python robofactory/policy/OpenVLA/test_single_env.py \
     --task LiftBarrier-rf \
     --checkpoint checkpoints/LiftBarrier-rf_Agent0_150/epoch_300 \
     --render
+```
+
+### Docker Environment
+
+```bash
+# 1. Build Docker image (one time)
+cd /localhome/local-chrislin/OpenMARL
+docker build -t openmarl/openvla:latest -f robofactory/policy/OpenVLA/Dockerfile .
+
+# 2. Run training in Docker (single GPU)
+docker run --gpus '"device=0"' -it --rm --shm-size=16g \
+    -v $(pwd)/data:/workspace/OpenMARL/data \
+    -v $(pwd)/checkpoints:/workspace/OpenMARL/checkpoints \
+    -e WANDB_API_KEY=$WANDB_API_KEY \
+    openmarl/openvla:latest \
+    bash -c "bash robofactory/policy/OpenVLA/train.sh LiftBarrier-rf 150 0 100 0"
+
+# 3. Run training in Docker (8 GPUs)
+docker run --gpus all -it --rm --shm-size=32g --ipc=host \
+    -v $(pwd)/data:/workspace/OpenMARL/data \
+    -v $(pwd)/checkpoints:/workspace/OpenMARL/checkpoints \
+    -e WANDB_API_KEY=$WANDB_API_KEY \
+    -e CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+    openmarl/openvla:latest \
+    bash -c "torchrun --standalone --nnodes=1 --nproc-per-node=8 \
+        robofactory/policy/OpenVLA/train.py --config-name=robot_openvla.yaml \
+        task.name=LiftBarrier-rf task.dataset.rlds_path=data/rlds_data/LiftBarrier-rf_Agent0_150"
+
+# 4. Monitor Docker training
+docker logs -f openvla-train
 ```
 
 ---

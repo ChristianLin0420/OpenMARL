@@ -42,7 +42,7 @@ export HYDRA_FULL_ERROR=1
 export CUDA_VISIBLE_DEVICES=${gpu_id}
 
 # Check if RLDS data exists, if not suggest conversion
-rlds_path="data/rlds_data/${task_name}_Agent${agent_id}_${load_num}"
+rlds_path="robofactory/data/rlds_data/${task_name}_Agent${agent_id}"
 if [ ! -d "$rlds_path" ]; then
     echo -e "\033[31mError: RLDS dataset not found at ${rlds_path}\033[0m"
     echo -e "\033[33mPlease convert ZARR data to RLDS format first:\033[0m"

@@ -6,13 +6,13 @@ robofactory/outputs/
 robofactory/evaluation_results/
 robofactory/planner/solutions/
 
-# Exclude build artifacts
-robofactory.egg-info/
+# Python
 __pycache__/
-*.pyc
-*.pyo
-*.pyd
+*.py[cod]
+*$py.class
+*.so
 .Python
+env/
 build/
 develop-eggs/
 dist/
@@ -41,8 +41,26 @@ wheels/
 .idea/
 *.swp
 *.swo
+*~
 
-# Exclude temporary files
-.DS_Store
-Thumbs.db
+# Data and outputs (mount as volumes instead)
+data/
+checkpoints/
+logs/
+*.zarr
+*.tfrecord
 
+# Cursor
+.cursor/
+
+# Git
+.git/
+.gitignore
+
+# Cache
+.cache/
+*.cache
+
+# Temporary files
+*.tmp
+*.log
