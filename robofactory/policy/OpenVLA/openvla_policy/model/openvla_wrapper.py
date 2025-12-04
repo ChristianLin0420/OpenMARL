@@ -248,12 +248,18 @@ class OpenVLAModel(nn.Module):
         """
         os.makedirs(save_directory, exist_ok=True)
         
+        # Handle DDP wrapper - get the underlying model
+        model_to_save = self.model
+        if hasattr(self.model, 'module'):
+            # Model is wrapped with DDP, get the underlying module
+            model_to_save = self.model.module
+        
         if self.use_lora:
             # Save LoRA weights only
-            self.model.save_pretrained(save_directory)
+            model_to_save.save_pretrained(save_directory)
         else:
             # Save full model
-            self.model.save_pretrained(save_directory)
+            model_to_save.save_pretrained(save_directory)
         
         # Save processor
         self.processor.save_pretrained(save_directory)

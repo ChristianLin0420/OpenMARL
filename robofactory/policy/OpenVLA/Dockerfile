@@ -32,7 +32,29 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxrender-dev \
     libgomp1 \
     ffmpeg \
+    # Vulkan/EGL dependencies for headless rendering (SAPIEN)
+    libvulkan1 \
+    libvulkan-dev \
+    vulkan-tools \
+    libegl1-mesa \
+    libegl1-mesa-dev \
+    libgl1-mesa-dev \
+    libgles2-mesa-dev \
+    libglvnd0 \
+    libglvnd-dev \
+    mesa-vulkan-drivers \
     && rm -rf /var/lib/apt/lists/*
+
+# Create EGL/Vulkan ICD directories for headless rendering
+RUN mkdir -p /usr/share/glvnd/egl_vendor.d \
+    && mkdir -p /etc/glvnd/egl_vendor.d \
+    && mkdir -p /usr/share/egl/egl_external_platform.d \
+    && mkdir -p /usr/share/vulkan/icd.d
+
+# Set environment variables for headless rendering
+ENV PYOPENGL_PLATFORM=egl
+ENV MUJOCO_GL=egl
+ENV NVIDIA_DRIVER_CAPABILITIES=graphics,utility,compute
 
 # Upgrade pip and install build tools
 RUN pip install --upgrade pip setuptools wheel

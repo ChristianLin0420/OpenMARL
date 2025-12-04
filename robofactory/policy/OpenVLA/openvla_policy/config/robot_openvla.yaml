@@ -39,11 +39,22 @@ training:
   
   # Validation
   val_split: 0.1
-  val_every: 10
+  val_every: 1                     # DEBUG: validate every epoch
   
   # Checkpointing
-  checkpoint_every: 50
+  checkpoint_every: 5              # DEBUG: checkpoint every 5 epochs
   resume: True
+  
+  # Early stopping (plateau detection - stops when loss stops improving)
+  early_stopping: True
+  early_stopping_patience: 3       # DEBUG: reduced patience
+  early_stopping_min_delta: 1e-7   # Minimum change in loss to count as improvement
+  
+  # Simulation evaluation during training
+  eval_in_sim: True                # Enable with Docker image that has Vulkan/EGL
+  eval_sim_every_n_epochs: 2       # DEBUG: run sim eval every 2 epochs
+  eval_sim_episodes: 1             # DEBUG: 1 episode per evaluation
+  eval_sim_max_steps: 50           # DEBUG: reduced max steps
   
   # Debug mode
   debug: False
@@ -67,8 +78,13 @@ val_dataloader:
 logging:
   project: "robofactory"
   mode: "online"  # online, offline, or disabled
-  name: "${now:%Y.%m.%d-%H.%M.%S}_${name}_${task_name}"
+  name: "${task_name}_${exp_name}"
   tags: ["${name}", "${task_name}", "${exp_name}"]
+  
+  # Detailed logging
+  log_every_n_steps: 5            # DEBUG: log every 5 steps
+  log_gradients: False            # Log gradient histograms (expensive)
+  log_learning_rate: True         # Log learning rate
 
 # Hydra configuration
 hydra:
