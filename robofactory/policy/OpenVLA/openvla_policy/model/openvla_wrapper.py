@@ -50,15 +50,22 @@ class OpenVLAModel(nn.Module):
         self.torch_dtype = torch_dtype
         self.device = device
         
+        # Determine logging rank (rank 1 in distributed, or single process)
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        world_size = int(os.environ.get("WORLD_SIZE", 1))
+        self._is_logging_rank = (world_size == 1) or (local_rank == 1)
+        
         # Load processor
-        print(f"Loading processor from {model_name}...")
+        if self._is_logging_rank:
+            print(f"Loading processor from {model_name}...")
         self.processor = AutoProcessor.from_pretrained(
             model_name,
             trust_remote_code=True
         )
         
         # Load model
-        print(f"Loading model from {model_name}...")
+        if self._is_logging_rank:
+            print(f"Loading model from {model_name}...")
         self.model = AutoModelForVision2Seq.from_pretrained(
             model_name,
             torch_dtype=torch_dtype,
@@ -68,11 +75,13 @@ class OpenVLAModel(nn.Module):
         
         # Setup LoRA if enabled
         if use_lora:
-            print(f"Setting up LoRA with rank={lora_rank}, alpha={lora_alpha}")
+            if self._is_logging_rank:
+                print(f"Setting up LoRA with rank={lora_rank}, alpha={lora_alpha}")
             self._setup_lora(lora_rank, lora_alpha, lora_dropout)
         
-        # Move to device
-        self.model = self.model.to(device)
+        # Move to device (use LOCAL_RANK for distributed training)
+        self.device = torch.device(f"cuda:{local_rank}")
+        self.model = self.model.to(self.device)
         
         # Statistics for action denormalization
         self.action_mean = None
@@ -100,7 +109,8 @@ class OpenVLAModel(nn.Module):
         
         # Apply LoRA
         self.model = get_peft_model(self.model, lora_config)
-        self.model.print_trainable_parameters()
+        if self._is_logging_rank:
+            self.model.print_trainable_parameters()
     
     def set_action_statistics(self, mean: np.ndarray, std: np.ndarray):
         """
@@ -248,7 +258,8 @@ class OpenVLAModel(nn.Module):
         # Save processor
         self.processor.save_pretrained(save_directory)
         
-        print(f"Model saved to {save_directory}")
+        if self._is_logging_rank:
+            print(f"Model saved to {save_directory}")
     
     @classmethod
     def from_pretrained(

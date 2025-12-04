@@ -35,15 +35,23 @@ OmegaConf.register_new_resolver("eval", eval, replace=True)
 )
 def main(cfg: OmegaConf):
     """Main training function."""
+    import torch.distributed as dist
+    
+    # Determine if this is the logging rank (rank 1 in distributed, or single process)
+    is_logging_rank = True
+    if dist.is_initialized():
+        is_logging_rank = dist.get_rank() == 1
+    
     # Resolve config
     OmegaConf.resolve(cfg)
     
-    # Print config
-    print("=" * 80)
-    print("Training Configuration:")
-    print("=" * 80)
-    print(OmegaConf.to_yaml(cfg))
-    print("=" * 80)
+    # Print config only from logging rank
+    if is_logging_rank:
+        print("=" * 80)
+        print("Training Configuration:")
+        print("=" * 80)
+        print(OmegaConf.to_yaml(cfg))
+        print("=" * 80)
     
     # Import workspace
     from openvla_policy.workspace.openvla_workspace import OpenVLAWorkspace
@@ -52,10 +60,12 @@ def main(cfg: OmegaConf):
     workspace = OpenVLAWorkspace(cfg)
     
     # Run training
-    print(f"\nStarting training for task: {cfg.task_name}")
+    if is_logging_rank:
+        print(f"\nStarting training for task: {cfg.task_name}")
     workspace.run()
     
-    print("\nTraining complete!")
+    if is_logging_rank:
+        print("\nTraining complete!")
 
 
 if __name__ == "__main__":

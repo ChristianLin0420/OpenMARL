@@ -56,11 +56,16 @@ class OpenVLAWorkspace:
         if self.is_distributed:
             self.rank = dist.get_rank()
             self.world_size = dist.get_world_size()
-            self.is_main_process = self.rank == 0
+            # Use rank 1 for logging to avoid conflicts with rank 0
+            self.is_main_process = self.rank == 1
         else:
             self.rank = 0
             self.world_size = 1
             self.is_main_process = True
+        
+        # Disable wandb for non-main processes
+        if not self.is_main_process:
+            os.environ["WANDB_MODE"] = "disabled"
         
         # Set random seed
         self._set_seed(cfg.training.seed)
@@ -285,9 +290,10 @@ class OpenVLAWorkspace:
         )
         
         for batch_idx, batch in enumerate(pbar):
-            # Move to device
-            images = batch['image'].to(cfg.training.device)
-            actions = batch['action'].to(cfg.training.device)
+            # Move to device (use model's device for correct GPU in distributed training)
+            device = self.model.device
+            images = batch['image'].to(device)
+            actions = batch['action'].to(device)
             instructions = batch['instruction']
             
             # Forward pass
@@ -341,9 +347,10 @@ class OpenVLAWorkspace:
         )
         
         for batch_idx, batch in enumerate(pbar):
-            # Move to device
-            images = batch['image'].to(cfg.training.device)
-            actions = batch['action'].to(cfg.training.device)
+            # Move to device (use model's device for correct GPU in distributed training)
+            device = self.model.device
+            images = batch['image'].to(device)
+            actions = batch['action'].to(device)
             instructions = batch['instruction']
             
             # Forward pass

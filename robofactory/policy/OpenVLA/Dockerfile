@@ -38,16 +38,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN pip install --upgrade pip setuptools wheel
 
 # Copy setup files first for better caching
-COPY setup.py /workspace/OpenMARL/
-COPY README.md /workspace/OpenMARL/
-COPY robofactory/__init__.py /workspace/OpenMARL/robofactory/
+COPY setup.py /workspace/
+COPY README.md /workspace/
+COPY robofactory/__init__.py /workspace/robofactory/
 
 # Install OpenMARL package (following README.md installation steps)
-WORKDIR /workspace/OpenMARL
 RUN pip install -e .
 
 # Copy and install robofactory requirements
-COPY robofactory/requirements.txt /workspace/OpenMARL/robofactory/
+COPY robofactory/requirements.txt /workspace/robofactory/
 RUN pip install --no-cache-dir -r robofactory/requirements.txt
 
 # Copy and install OpenVLA-specific requirements
@@ -63,10 +62,7 @@ RUN pip install --no-cache-dir flash-attn==2.5.5 --no-build-isolation || \
 RUN pip install numcodecs==0.12.1
 
 # Copy the full OpenMARL codebase
-COPY . /workspace/OpenMARL/
-
-# Set working directory to OpenMARL root
-WORKDIR /workspace/OpenMARL
+COPY . /workspace/
 
 # Create necessary directories
 RUN mkdir -p \
@@ -77,11 +73,10 @@ RUN mkdir -p \
     logs
 
 # Add robofactory to PYTHONPATH
-ENV PYTHONPATH=/workspace/OpenMARL:/workspace/OpenMARL/robofactory:${PYTHONPATH}
+ENV PYTHONPATH=/workspace:/workspace/robofactory:${PYTHONPATH}
 
 # Expose wandb port (optional)
 EXPOSE 8080
 
 # Default command: launch bash
 CMD ["/bin/bash"]
-

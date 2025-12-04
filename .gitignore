@@ -60,3 +60,7 @@ htmlcov/
 !robofactory/assets/.gitkeep
 
 outputs/
+
+# Slurm server files
+interactive.sh
+train.sh
