@@ -79,6 +79,9 @@ RUN pip install numcodecs==0.12.1
 COPY . /workspace/OpenMARL/
 RUN pip install -e /workspace/OpenMARL
 
+# Install for wandb media
+RUN pip install wandb[media]
+
 # Create necessary directories
 RUN mkdir -p \
     /workspace/OpenMARL/data/rlds_data \

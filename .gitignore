@@ -64,3 +64,7 @@ outputs/
 # Slurm server files
 interactive.sh
 train.sh
+sbatch.sh
+
+# Logs
+logs/

@@ -21,6 +21,7 @@ from tqdm import tqdm
 from omegaconf import OmegaConf
 from PIL import Image
 
+import robofactory.tasks
 from ..model.openvla_wrapper import OpenVLAModel
 from ..dataset.robot_rlds_dataset import RobotRLDSDataset, collate_fn
 
@@ -97,6 +98,9 @@ class OpenVLAWorkspace:
         """Initialize model with LoRA."""
         cfg = self.cfg
         
+        # Get action_dim from config or default to 8 (Panda: 7 joints + gripper)
+        action_dim = getattr(cfg.model, 'action_dim', 8)
+        
         self.model = OpenVLAModel(
             model_name=cfg.model.model_name,
             use_lora=cfg.model.use_lora,
@@ -105,6 +109,7 @@ class OpenVLAWorkspace:
             lora_dropout=cfg.model.lora_dropout,
             torch_dtype=getattr(torch, cfg.model.torch_dtype),
             device=cfg.training.device,
+            action_dim=action_dim,
         )
         
         # Wrap with DDP if distributed
@@ -113,7 +118,7 @@ class OpenVLAWorkspace:
                 self.model.model,
                 device_ids=[self.rank],
                 output_device=self.rank,
-                find_unused_parameters=False,
+                find_unused_parameters=False,  # No unused parameters in forward pass
             )
     
     def _init_optimizer(self):
@@ -168,10 +173,23 @@ class OpenVLAWorkspace:
         # Setup action statistics for denormalization
         stats = train_dataset.get_statistics()
         if 'action' in stats:
+            action_mean = stats['action']['mean']
+            action_std = stats['action']['std']
+            
+            # Update model's action_dim based on actual data
+            data_action_dim = len(action_mean)
+            if data_action_dim != self.model.action_dim:
+                if self.is_main_process:
+                    print(f"Updating action_dim from {self.model.action_dim} to {data_action_dim} based on dataset")
+                self.model.action_dim = data_action_dim
+            
             self.model.set_action_statistics(
-                mean=stats['action']['mean'],
-                std=stats['action']['std'],
+                mean=action_mean,
+                std=action_std,
             )
+            
+            if self.is_main_process:
+                print(f"Loaded {len(train_dataset)} samples (train), action_dim={data_action_dim}")
         
         # Create samplers for distributed training
         train_sampler = None
@@ -320,7 +338,7 @@ class OpenVLAWorkspace:
                 if self.is_distributed:
                     dist.barrier()
             
-            # Simulation evaluation (only on main process, with barrier sync)
+            # Simulation evaluation (optimized with GPU backend + parallel envs)
             if hasattr(cfg.training, 'eval_in_sim') and cfg.training.eval_in_sim:
                 eval_every = getattr(cfg.training, 'eval_sim_every_n_epochs', 10)
                 if (epoch + 1) % eval_every == 0:
@@ -328,7 +346,7 @@ class OpenVLAWorkspace:
                     if self.is_main_process and sim_metrics:
                         metrics.update(sim_metrics)
                         print(f"Simulation eval: {sim_metrics}")
-                    # Barrier to ensure all ranks wait for simulation evaluation to complete
+                    # Barrier to ensure all ranks wait for simulation evaluation
                     if self.is_distributed:
                         dist.barrier()
             
@@ -350,6 +368,35 @@ class OpenVLAWorkspace:
         # Final save
         if self.is_main_process:
             self.save_checkpoint(name='final.ckpt')
+        
+        # Wait for all ranks before simulation evaluation
+        if self.is_distributed:
+            dist.barrier()
+        
+        # Final simulation evaluation (runs AFTER training to avoid NCCL timeouts)
+        if self.is_main_process and hasattr(cfg.training, 'eval_in_sim') and cfg.training.eval_in_sim:
+            print("Running final simulation evaluation...")
+            sim_metrics = self._evaluate_in_simulation()
+            if sim_metrics:
+                print(f"Final simulation eval: {sim_metrics}")
+                if cfg.logging.mode == "online":
+                    wandb.log(sim_metrics, step=self.global_step)
+                    for k, v in sim_metrics.items():
+                        wandb.run.summary[f"final_{k}"] = v
+        
+        # Wait for simulation to complete before finishing
+        if self.is_distributed:
+            dist.barrier()
+        
+        # Cleanup eval environment
+        if self.eval_env is not None:
+            try:
+                self.eval_env.close()
+                self.eval_env = None
+            except:
+                pass
+        
+        if self.is_main_process:
             if cfg.logging.mode == "online":
                 # Log final summary
                 wandb.run.summary["final_train_loss"] = train_metrics.get('train_loss', 0)
@@ -459,16 +506,56 @@ class OpenVLAWorkspace:
                 total_norm += param_norm.item() ** 2
         return total_norm ** 0.5
     
-    @torch.no_grad()
-    def _evaluate_in_simulation(self) -> Dict[str, Any]:
-        """
-        Run model evaluation in simulation environment and log results/videos to wandb.
+    def _get_env_action_dim(self, env) -> int:
+        """Get the expected action dimension from an environment.
         
-        Returns:
-            Dictionary with evaluation metrics (success_rate, etc.)
+        Handles both single-agent and multi-agent environments.
         """
-        if not self.is_main_process:
-            return {}
+        try:
+            env_unwrapped = env.unwrapped if hasattr(env, 'unwrapped') else env
+            
+            # Try single_action_space first (for vectorized/parallel envs)
+            if hasattr(env_unwrapped, 'single_action_space'):
+                action_space = env_unwrapped.single_action_space
+                # Multi-agent: action_space is a Dict
+                if hasattr(action_space, 'spaces'):
+                    # Get action dim for first agent (e.g., 'panda-0')
+                    for key, space in action_space.spaces.items():
+                        if hasattr(space, 'shape'):
+                            return space.shape[-1]
+                elif hasattr(action_space, 'shape'):
+                    return action_space.shape[-1]
+            
+            # Try regular action_space
+            if hasattr(env_unwrapped, 'action_space'):
+                action_space = env_unwrapped.action_space
+                # Multi-agent: action_space is a Dict
+                if hasattr(action_space, 'spaces'):
+                    for key, space in action_space.spaces.items():
+                        if hasattr(space, 'shape'):
+                            return space.shape[-1]
+                elif hasattr(action_space, 'shape'):
+                    return action_space.shape[-1]
+            
+            # Try getting from agent
+            if hasattr(env_unwrapped, 'agent'):
+                agent = env_unwrapped.agent
+                if hasattr(agent, 'agents'):
+                    # Multi-agent - get from first agent
+                    for uid, sub_agent in agent.agents.items():
+                        if hasattr(sub_agent, 'action_space') and hasattr(sub_agent.action_space, 'shape'):
+                            return sub_agent.action_space.shape[-1]
+                elif hasattr(agent, 'action_space') and hasattr(agent.action_space, 'shape'):
+                    return agent.action_space.shape[-1]
+        except Exception as e:
+            print(f"Warning: Could not determine action dimension: {e}")
+        
+        return None
+    
+    def _init_eval_env(self):
+        """Lazy initialization of evaluation environment (GPU backend + parallel envs)."""
+        if self.eval_env is not None:
+            return True
         
         cfg = self.cfg
         
@@ -477,7 +564,7 @@ class OpenVLAWorkspace:
         os.environ["MUJOCO_GL"] = "egl"
         os.environ["DISPLAY"] = ""
         
-        # Create ALL missing EGL directories that SAPIEN might check for headless rendering
+        # Create ALL missing EGL directories that SAPIEN might check
         egl_dirs = [
             "/usr/share/glvnd/egl_vendor.d",
             "/etc/glvnd/egl_vendor.d",
@@ -488,130 +575,261 @@ class OpenVLAWorkspace:
                 try:
                     os.makedirs(egl_dir, exist_ok=True)
                 except PermissionError:
-                    pass  # Silently skip if no permission
+                    pass
         
         try:
             import gymnasium as gym
-            from robofactory.envs.wrappers import RecordEpisodeMA
         except (ImportError, FileNotFoundError, OSError) as e:
             print(f"Warning: Could not import simulation dependencies: {e}")
-            print("Skipping simulation evaluation - graphics environment not available")
-            return {}
-        
-        # Get evaluation settings
-        num_episodes = getattr(cfg.training, 'eval_sim_episodes', 3)
-        max_steps = getattr(cfg.training, 'eval_sim_max_steps', 200)
+            return False
         
         # Determine environment ID from task
-        env_id = cfg.task.name + '-rf' if hasattr(cfg.task, 'name') else None
-        if env_id is None:
-            print("Warning: Could not determine environment ID for simulation eval")
-            return {}
+        env_id = cfg.task.name if hasattr(cfg.task, 'name') else None
+        if env_id and not env_id.endswith('-rf'):
+            env_id += '-rf'
         
-        print(f"\nRunning simulation evaluation: {num_episodes} episodes in {env_id}")
+        if env_id is None:
+            print("Warning: Could not determine environment ID")
+            return False
+        
+        # Get parallel env count from config (default 4 for faster eval)
+        num_parallel = getattr(cfg.training, 'eval_sim_num_envs', 4)
         
         try:
-            # Create environment
+            # Use GPU backend for much faster simulation
+            # Use pd_joint_pos control mode to match dataset action space
             env_kwargs = dict(
                 obs_mode='rgb',
-                control_mode='pd_ee_delta_pose',
+                control_mode='pd_joint_pos',  # Match dataset: 7 joints + gripper
                 render_mode='rgb_array',
-                num_envs=1,
-                sim_backend='cpu',
+                num_envs=num_parallel,
+                sim_backend='gpu',  # GPU backend for 10-100x speedup
             )
             
-            # Add config path if available
             if hasattr(cfg.task, 'config_path'):
                 env_kwargs['config'] = cfg.task.config_path
             
-            env = gym.make(env_id, **env_kwargs)
+            self.eval_env = gym.make(env_id, **env_kwargs)
+            self.eval_env_id = env_id
+            self.eval_num_parallel = num_parallel
             
+            # Get the expected action dimension from environment
+            self.eval_action_dim = self._get_env_action_dim(self.eval_env)
+            
+            print(f"Initialized eval env: {env_id} with {num_parallel} parallel envs (GPU), action_dim={self.eval_action_dim}")
+            return True
+            
+        except Exception as e:
+            # Fallback to CPU if GPU fails
+            print(f"GPU backend failed ({e}), falling back to CPU...")
+            try:
+                env_kwargs['sim_backend'] = 'cpu'
+                env_kwargs['num_envs'] = 1
+                self.eval_env = gym.make(env_id, **env_kwargs)
+                self.eval_env_id = env_id
+                self.eval_num_parallel = 1
+                
+                # Get the expected action dimension
+                self.eval_action_dim = self._get_env_action_dim(self.eval_env)
+                
+                print(f"Initialized eval env: {env_id} with 1 env (CPU fallback), action_dim={self.eval_action_dim}")
+                return True
+            except Exception as e2:
+                print(f"Warning: Could not create eval environment: {e2}")
+                return False
+    
+    @torch.no_grad()
+    def _evaluate_in_simulation(self) -> Dict[str, Any]:
+        """
+        Run model evaluation in simulation environment and log results/videos to wandb.
+        
+        Optimizations:
+        - Lazy init: reuses environment across evaluations
+        - GPU backend: 10-100x faster simulation
+        - Parallel envs: runs multiple episodes simultaneously
+        - Cached instruction: avoids repeated attribute access
+        
+        Returns:
+            Dictionary with evaluation metrics (success_rate, etc.)
+        """
+        if not self.is_main_process:
+            return {}
+        
+        cfg = self.cfg
+        
+        # Lazy initialize environment (only once)
+        if not self._init_eval_env():
+            print("Skipping simulation evaluation - environment not available")
+            return {}
+        
+        env = self.eval_env
+        num_parallel = self.eval_num_parallel
+        
+        # Get evaluation settings
+        num_episodes = getattr(cfg.training, 'eval_sim_episodes', 5)
+        max_steps = getattr(cfg.training, 'eval_sim_max_steps', 200)
+        
+        # Calculate how many batches we need to run
+        num_batches = (num_episodes + num_parallel - 1) // num_parallel
+        
+        print(f"\nRunning simulation evaluation: {num_episodes} episodes ({num_batches} batches of {num_parallel})")
+        
+        try:
             # Set model to eval mode
             self.model.eval()
             
-            # Run evaluation episodes
-            success_count = 0
-            total_rewards = []
+            # Cache instruction for faster access
+            instruction = getattr(cfg.task, 'instruction', 'complete the task')
+            
+            # Results
+            all_successes = []
+            all_rewards = []
             all_frames = []
             
-            for ep in range(num_episodes):
+            for batch_idx in range(num_batches):
                 obs, info = env.reset()
-                episode_reward = 0.0
-                episode_frames = []
+                episode_rewards = np.zeros(num_parallel)
+                batch_frames = []
                 
                 for step in range(max_steps):
-                    # Get image observation
-                    if isinstance(obs, dict):
-                        # Handle different observation formats
-                        if 'rgb' in obs:
-                            image = obs['rgb']
-                        elif 'image' in obs:
-                            image = obs['image']
-                        elif 'sensor_data' in obs:
-                            # Get first camera's RGB
-                            sensor_data = obs['sensor_data']
-                            cam_key = list(sensor_data.keys())[0]
-                            image = sensor_data[cam_key].get('rgb', None)
-                        else:
-                            image = None
-                    else:
-                        image = obs
-                    
-                    if image is None:
-                        print(f"Warning: Could not extract image from observation")
+                    # Extract images from observation (handle parallel envs)
+                    images = self._extract_images_from_obs(obs, num_parallel)
+                    if images is None:
                         break
                     
-                    # Convert to tensor format expected by model
-                    if isinstance(image, np.ndarray):
-                        # Normalize to [0, 1] and convert to (C, H, W)
-                        if image.max() > 1.0:
-                            image = image.astype(np.float32) / 255.0
-                        if image.ndim == 3 and image.shape[-1] == 3:
-                            image = np.transpose(image, (2, 0, 1))
-                        image = torch.from_numpy(image).float()
+                    # Ensure images is a list
+                    if not isinstance(images, list):
+                        images = [images]
                     
-                    # Get instruction from task config or use default
-                    instruction = getattr(cfg.task, 'instruction', 'complete the task')
+                    # Batch predict actions for all parallel envs
+                    actions = []
+                    for i in range(num_parallel):
+                        img = images[i] if i < len(images) else images[0]
+                        action = self.model.predict_action(
+                            img.to(self.model.device),
+                            instruction,
+                            do_sample=False
+                        )
+                        actions.append(action)
                     
-                    # Predict action
-                    action = self.model.predict_action(
-                        image.to(self.model.device),
-                        instruction,
-                        do_sample=False
-                    )
+                    # Adjust action dimensions to match environment's expected action space
+                    env_action_dim = getattr(self, 'eval_action_dim', None)
+                    if env_action_dim is not None:
+                        adjusted_actions = []
+                        for action in actions:
+                            if len(action) > env_action_dim:
+                                # Truncate to match environment
+                                action = action[:env_action_dim]
+                            elif len(action) < env_action_dim:
+                                # Pad with zeros
+                                padding = np.zeros(env_action_dim - len(action))
+                                action = np.concatenate([action, padding])
+                            adjusted_actions.append(action)
+                        actions = adjusted_actions
+                    
+                    # Format actions for the environment
+                    # Check if it's a multi-agent environment
+                    # Use unwrapped to access agent attribute properly
+                    env_unwrapped = env.unwrapped if hasattr(env, 'unwrapped') else env
+                    is_multi_agent = hasattr(env_unwrapped, 'agent') and hasattr(env_unwrapped.agent, 'agents')
+                    
+                    if is_multi_agent:
+                        # Multi-agent environment expects dict: {'panda-0': action, 'panda-1': action, ...}
+                        num_agents = len(env_unwrapped.agent.agents)
+                        
+                        if num_parallel > 1:
+                            # For parallel envs: {'agent_uid': (num_envs, action_dim)}
+                            action_batch = {}
+                            stacked_actions = np.stack(actions, axis=0)  # (num_envs, action_dim)
+                            for agent_idx in range(num_agents):
+                                agent_uid = f'panda-{agent_idx}'
+                                if agent_idx == 0:
+                                    # Use predicted actions for agent 0
+                                    action_batch[agent_uid] = stacked_actions
+                                else:
+                                    # Use zero actions for other agents (they're not being controlled)
+                                    action_batch[agent_uid] = np.zeros_like(stacked_actions)
+                        else:
+                            # For single env: {'agent_uid': (action_dim,)}
+                            action_batch = {}
+                            for agent_idx in range(num_agents):
+                                agent_uid = f'panda-{agent_idx}'
+                                if agent_idx == 0:
+                                    action_batch[agent_uid] = actions[0]
+                                else:
+                                    action_batch[agent_uid] = np.zeros_like(actions[0])
+                    else:
+                        # Single-agent environment
+                        if num_parallel > 1:
+                            action_batch = np.stack(actions, axis=0)
+                        else:
+                            action_batch = actions[0]
                     
                     # Step environment
-                    obs, reward, terminated, truncated, info = env.step(action)
-                    episode_reward += reward
+                    obs, reward, terminated, truncated, info = env.step(action_batch)
                     
-                    # Capture frame for video (every 5 steps to reduce size)
-                    if step % 5 == 0:
-                        frame = env.render()
-                        if frame is not None:
-                            episode_frames.append(frame)
+                    # Helper to convert CUDA tensors to numpy
+                    def to_numpy(x):
+                        if isinstance(x, torch.Tensor):
+                            return x.detach().cpu().numpy()
+                        return np.array(x) if not np.isscalar(x) else x
                     
-                    if terminated or truncated:
+                    # Handle scalar vs array rewards
+                    reward_np = to_numpy(reward)
+                    if np.isscalar(reward_np):
+                        episode_rewards[0] += reward_np
+                    else:
+                        episode_rewards += np.array(reward_np).flatten()[:num_parallel]
+                    
+                    # Capture frame for video (first env only, every 10 steps)
+                    if batch_idx == num_batches - 1:
+                        try:
+                            frame = env.render()
+                            if frame is not None:
+                                # Handle batched render output
+                                if isinstance(frame, np.ndarray) and frame.ndim == 4:
+                                    frame = frame[0]  # Take first env
+                                elif isinstance(frame, torch.Tensor) and frame.ndim == 4:
+                                    frame = frame[0].cpu().numpy()
+                                batch_frames.append(frame)
+                        except:
+                            pass
+                    
+                    # Check if all envs are done (convert CUDA tensors to numpy)
+                    terminated_np = to_numpy(terminated)
+                    truncated_np = to_numpy(truncated)
+                    done = np.logical_or(terminated_np, truncated_np)
+                    if np.isscalar(done):
+                        if done:
+                            break
+                    elif np.all(done):
                         break
                 
-                # Check success
-                if info.get('success', False):
-                    success_count += 1
+                # Collect results from this batch
+                if isinstance(info, dict):
+                    success = info.get('success', False)
+                    success_np = to_numpy(success) if not isinstance(success, bool) else success
+                    if np.isscalar(success_np):
+                        all_successes.append(success_np)
+                    else:
+                        all_successes.extend(np.array(success_np).flatten()[:num_parallel].tolist())
                 
-                total_rewards.append(episode_reward)
+                all_rewards.extend(episode_rewards[:num_parallel].tolist())
                 
-                # Keep frames from last episode for video
-                if ep == num_episodes - 1:
-                    all_frames = episode_frames
+                # Keep frames from last batch for video
+                if batch_idx == num_batches - 1:
+                    all_frames = batch_frames
             
-            env.close()
+            # Compute metrics (use only num_episodes results)
+            successes = all_successes[:num_episodes]
+            rewards = all_rewards[:num_episodes]
             
-            # Compute metrics
-            success_rate = success_count / num_episodes
-            avg_reward = np.mean(total_rewards)
+            success_rate = sum(successes) / len(successes) if successes else 0.0
+            avg_reward = np.mean(rewards) if rewards else 0.0
             
             metrics = {
-                'eval/sim_success_rate': success_rate,
-                'eval/sim_avg_reward': avg_reward,
+                'eval/sim_success_rate': float(success_rate),
+                'eval/sim_avg_reward': float(avg_reward),
                 'eval/sim_episodes': num_episodes,
             }
             
@@ -622,17 +840,14 @@ class OpenVLAWorkspace:
                 # Log video if we have frames
                 if all_frames and len(all_frames) > 0:
                     try:
-                        # Stack frames into video array (T, H, W, C)
                         video_array = np.stack(all_frames, axis=0)
-                        # wandb expects (T, C, H, W) for video
                         if video_array.ndim == 4 and video_array.shape[-1] == 3:
                             video_array = np.transpose(video_array, (0, 3, 1, 2))
-                        
                         wandb.log({
                             "eval/sim_video": wandb.Video(video_array, fps=10, format="mp4")
                         }, step=self.global_step)
                     except Exception as e:
-                        print(f"Warning: Could not log video to wandb: {e}")
+                        print(f"Warning: Could not log video: {e}")
             
             # Set model back to train mode
             self.model.train()
@@ -643,7 +858,93 @@ class OpenVLAWorkspace:
             print(f"Warning: Simulation evaluation failed: {e}")
             import traceback
             traceback.print_exc()
+            self.model.train()
             return {}
+    
+    def _extract_images_from_obs(self, obs, num_parallel):
+        """Extract and preprocess images from observation dict."""
+        try:
+            if isinstance(obs, dict):
+                if 'rgb' in obs:
+                    image = obs['rgb']
+                elif 'image' in obs:
+                    image = obs['image']
+                elif 'sensor_data' in obs:
+                    sensor_data = obs['sensor_data']
+                    cam_key = list(sensor_data.keys())[0]
+                    image = sensor_data[cam_key].get('rgb', None)
+                else:
+                    return None
+            else:
+                image = obs
+            
+            if image is None:
+                return None
+            
+            # Handle Tensor (GPU backend)
+            if isinstance(image, torch.Tensor):
+                # Check if we have a batch dimension
+                if image.dim() == 4:
+                    images = []
+                    for i in range(min(num_parallel, image.shape[0])):
+                        img = image[i]  # (H, W, C) or (C, H, W)
+                        
+                        # Normalize if needed
+                        if img.max() > 1.0:
+                            img = img.float() / 255.0
+                        else:
+                            img = img.float()
+                        
+                        # Ensure (C, H, W)
+                        # If channels last (H, W, C), permute to (C, H, W)
+                        if img.shape[-1] in [3, 4]:
+                            img = img.permute(2, 0, 1)
+                        
+                        # If RGBA (4 channels), keep only RGB (3 channels)
+                        if img.shape[0] == 4:
+                            img = img[:3]
+                            
+                        images.append(img)
+                    return images
+                elif image.dim() == 3:
+                    # Single image (H, W, C) or (C, H, W)
+                    if image.max() > 1.0:
+                        image = image.float() / 255.0
+                    else:
+                        image = image.float()
+                        
+                    if image.shape[-1] in [3, 4]:
+                        image = image.permute(2, 0, 1)
+                    
+                    if image.shape[0] == 4:
+                        image = image[:3]
+                        
+                    return [image]
+            
+            # Convert to list of tensors for each parallel env
+            if isinstance(image, np.ndarray):
+                # Handle batched images (B, H, W, C) or single (H, W, C)
+                if image.ndim == 4:
+                    images = []
+                    for i in range(min(num_parallel, image.shape[0])):
+                        img = image[i]
+                        if img.max() > 1.0:
+                            img = img.astype(np.float32) / 255.0
+                        if img.shape[-1] == 3:
+                            img = np.transpose(img, (2, 0, 1))
+                        images.append(torch.from_numpy(img).float())
+                    return images
+                else:
+                    if image.max() > 1.0:
+                        image = image.astype(np.float32) / 255.0
+                    if image.ndim == 3 and image.shape[-1] == 3:
+                        image = np.transpose(image, (2, 0, 1))
+                    return torch.from_numpy(image).float()
+            
+            return image
+        except Exception as e:
+            print(f"Warning: Could not extract images: {e}")
+            return None
     
     @torch.no_grad()
     def _val_epoch(self):

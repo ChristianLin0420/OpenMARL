@@ -208,7 +208,9 @@ def main(args):
     # Load config
     with open(args.config, 'r') as f:
         config = yaml.safe_load(f)
-        env_id = config['task_name'] + '-rf'
+        env_id = config['task_name']
+        if not env_id.endswith('-rf'):
+            env_id += '-rf'
     
     # Create environment
     env_kwargs = dict(

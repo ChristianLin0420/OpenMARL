@@ -15,14 +15,15 @@ model:
   lora_rank: 32
   lora_alpha: 64
   lora_dropout: 0.0
-  torch_dtype: "bfloat16"  # bfloat16, float16, or float32
+  torch_dtype: "bfloat16"
   image_size: 224
+  action_dim: 8
 
 # Training configuration
 training:
   device: "cuda:0"
   seed: 42
-  num_epochs: 300
+  num_epochs: 50
   learning_rate: 5.0e-4
   min_learning_rate: 1.0e-6
   weight_decay: 1.0e-6
@@ -35,41 +36,42 @@ training:
   
   # Image augmentation
   image_aug: True
-  augment_crop_ratio: 0.9  # Take 90% center/random crop
+  augment_crop_ratio: 0.9
   
   # Validation
   val_split: 0.1
-  val_every: 1                     # DEBUG: validate every epoch
+  val_every: 5                        # Validate every 5 epochs
   
   # Checkpointing
-  checkpoint_every: 5              # DEBUG: checkpoint every 5 epochs
-  resume: True
+  checkpoint_every: 10                # Checkpoint every 10 epochs
+  resume: False
   
-  # Early stopping (plateau detection - stops when loss stops improving)
+  # Early stopping
   early_stopping: True
-  early_stopping_patience: 3       # DEBUG: reduced patience
-  early_stopping_min_delta: 1e-7   # Minimum change in loss to count as improvement
+  early_stopping_patience: 20         # Wait 20 epochs before stopping
+  early_stopping_min_delta: 1e-7
   
-  # Simulation evaluation during training
-  eval_in_sim: True                # Enable with Docker image that has Vulkan/EGL
-  eval_sim_every_n_epochs: 2       # DEBUG: run sim eval every 2 epochs
-  eval_sim_episodes: 1             # DEBUG: 1 episode per evaluation
-  eval_sim_max_steps: 50           # DEBUG: reduced max steps
+  # Simulation evaluation
+  eval_in_sim: True
+  eval_sim_every_n_epochs: 10         # Run sim eval every 10 epochs
+  eval_sim_episodes: 10               # More episodes for reliable metrics
+  eval_sim_num_envs: 4
+  eval_sim_max_steps: 200             # Longer episodes
   
-  # Debug mode
+  # Debug mode (disabled for production)
   debug: False
-  max_train_steps: 10
-  max_val_steps: 5
+  max_train_steps: null
+  max_val_steps: null
 
 # Dataloader configuration
 dataloader:
-  batch_size: 16
-  num_workers: 4
+  batch_size: 32
+  num_workers: 8
   shuffle: True
   pin_memory: True
 
 val_dataloader:
-  batch_size: 16
+  batch_size: 32
   num_workers: 4
   shuffle: False
   pin_memory: True
@@ -77,14 +79,13 @@ val_dataloader:
 # Logging configuration
 logging:
   project: "robofactory"
-  mode: "online"  # online, offline, or disabled
+  mode: "online"
   name: "${task_name}_${exp_name}"
   tags: ["${name}", "${task_name}", "${exp_name}"]
   
-  # Detailed logging
-  log_every_n_steps: 5            # DEBUG: log every 5 steps
-  log_gradients: False            # Log gradient histograms (expensive)
-  log_learning_rate: True         # Log learning rate
+  log_every_n_steps: 50               # Log less frequently
+  log_gradients: True
+  log_learning_rate: True
 
 # Hydra configuration
 hydra:
