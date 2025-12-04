@@ -37,19 +37,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Upgrade pip and install build tools
 RUN pip install --upgrade pip setuptools wheel
 
-# Copy setup files first for better caching
-COPY setup.py /workspace/
-COPY README.md /workspace/
-COPY robofactory/__init__.py /workspace/robofactory/
+# Copy and install requirements (cached in image for faster startup)
+# These are copied separately so dependency layer is cached
+COPY robofactory/requirements.txt /tmp/robofactory_requirements.txt
+RUN pip install --no-cache-dir -r /tmp/robofactory_requirements.txt
 
-# Install OpenMARL package (following README.md installation steps)
-RUN pip install -e .
-
-# Copy and install robofactory requirements
-COPY robofactory/requirements.txt /workspace/robofactory/
-RUN pip install --no-cache-dir -r robofactory/requirements.txt
-
-# Copy and install OpenVLA-specific requirements
 COPY robofactory/policy/OpenVLA/requirements.txt /tmp/openvla_requirements.txt
 RUN pip install --no-cache-dir -r /tmp/openvla_requirements.txt
 
@@ -58,25 +50,32 @@ RUN pip install --no-cache-dir -r /tmp/openvla_requirements.txt
 RUN pip install --no-cache-dir flash-attn==2.5.5 --no-build-isolation || \
     echo "Warning: Flash Attention installation failed, continuing without it"
 
-# Update numcodes version
+# Update numcodecs version
 RUN pip install numcodecs==0.12.1
 
-# Copy the full OpenMARL codebase
-COPY . /workspace/
+# Copy the full codebase and install in editable mode
+COPY . /workspace/OpenMARL/
+RUN pip install -e /workspace/OpenMARL
 
 # Create necessary directories
 RUN mkdir -p \
-    data/rlds_data \
-    data/zarr_data \
-    data/outputs \
-    checkpoints \
-    logs
+    /workspace/OpenMARL/data/rlds_data \
+    /workspace/OpenMARL/data/zarr_data \
+    /workspace/OpenMARL/data/outputs \
+    /workspace/OpenMARL/checkpoints \
+    /workspace/OpenMARL/logs
 
 # Add robofactory to PYTHONPATH
-ENV PYTHONPATH=/workspace:/workspace/robofactory:${PYTHONPATH}
+ENV PYTHONPATH=/workspace/OpenMARL:/workspace/OpenMARL/robofactory:${PYTHONPATH}
+
+# Set working directory
+WORKDIR /workspace
 
 # Expose wandb port (optional)
 EXPOSE 8080
 
-# Default command: launch bash
+# For live file sync, mount your local directory at runtime:
+#   -v /path/to/OpenMARL:/workspace/OpenMARL
+
 CMD ["/bin/bash"]
+
