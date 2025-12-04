@@ -12,6 +12,14 @@ Usage:
 import sys
 import os
 
+# CRITICAL: Disable wandb for non-logging ranks IMMEDIATELY before any other imports
+# torchrun sets RANK env var; we only want rank 1 to log to wandb
+_rank = int(os.environ.get("RANK", 0))
+_world_size = int(os.environ.get("WORLD_SIZE", 1))
+_is_logging_rank = (_world_size == 1) or (_rank == 1)
+if not _is_logging_rank:
+    os.environ["WANDB_MODE"] = "disabled"
+
 # Add paths
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'openvla_policy'))
@@ -35,12 +43,8 @@ OmegaConf.register_new_resolver("eval", eval, replace=True)
 )
 def main(cfg: OmegaConf):
     """Main training function."""
-    import torch.distributed as dist
-    
-    # Determine if this is the logging rank (rank 1 in distributed, or single process)
-    is_logging_rank = True
-    if dist.is_initialized():
-        is_logging_rank = dist.get_rank() == 1
+    # Use the global logging rank flag (set at module level based on RANK env var)
+    is_logging_rank = _is_logging_rank
     
     # Resolve config
     OmegaConf.resolve(cfg)

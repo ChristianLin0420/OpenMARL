@@ -51,21 +51,18 @@ class OpenVLAWorkspace:
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         
-        # Initialize distributed training if needed
-        self.is_distributed = dist.is_initialized()
-        if self.is_distributed:
-            self.rank = dist.get_rank()
-            self.world_size = dist.get_world_size()
-            # Use rank 1 for logging to avoid conflicts with rank 0
-            self.is_main_process = self.rank == 1
-        else:
-            self.rank = 0
-            self.world_size = 1
-            self.is_main_process = True
+        # Initialize distributed training using environment variables set by torchrun
+        self.rank = int(os.environ.get("RANK", 0))
+        self.world_size = int(os.environ.get("WORLD_SIZE", 1))
+        self.is_distributed = self.world_size > 1
         
-        # Disable wandb for non-main processes
-        if not self.is_main_process:
-            os.environ["WANDB_MODE"] = "disabled"
+        # Initialize process group if distributed and not already initialized
+        if self.is_distributed and not dist.is_initialized():
+            dist.init_process_group(backend="nccl")
+        
+        # Use rank 1 for logging to avoid conflicts with rank 0
+        # (rank 0 often has extra work like gradient aggregation)
+        self.is_main_process = (self.world_size == 1) or (self.rank == 1)
         
         # Set random seed
         self._set_seed(cfg.training.seed)
