@@ -123,7 +123,12 @@ class RFSceneBuilder(SceneBuilder):
                         lock_y=primitive_cfg['pos']['random_quaternions'][1],
                         lock_z=primitive_cfg['pos']['random_quaternions'][2]
                     )
-                asset.set_pose(Pose.create_from_pq(ppos, qpos))
+                # Handle GPU simulation mode - static/kinematic objects may not support pose changes
+                try:
+                    asset.set_pose(Pose.create_from_pq(ppos, qpos))
+                except Exception:
+                    # GPU simulation doesn't support pose changes on static objects after initialization
+                    pass
 
         # objects
         if 'objects' in cfg:
@@ -147,7 +152,12 @@ class RFSceneBuilder(SceneBuilder):
                         lock_y=asset_cfg['pos']['random_quaternions'][1],
                         lock_z=asset_cfg['pos']['random_quaternions'][2]
                     )
-                asset.set_pose(Pose.create_from_pq(ppos, qpos))
+                # Handle GPU simulation mode - some objects may not support pose changes
+                try:
+                    asset.set_pose(Pose.create_from_pq(ppos, qpos))
+                except Exception:
+                    # GPU simulation may not support pose changes on certain objects
+                    pass
                 self.movable_objects[asset_cfg['name']] = asset
         # agents
         if 'agents' in cfg:

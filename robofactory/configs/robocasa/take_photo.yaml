@@ -14,7 +14,7 @@ scene:
         half_size: 0.06
         color: [0.5, 0.5, 0.5, 1]
         name: cube
-        body_type: static
+        body_type: kinematic  # Changed from static for GPU simulation compatibility
         initial_pose:
           p: [2.5, -3.45, 0.95]
       pos:

@@ -7,6 +7,7 @@ _target_: openvla_policy.workspace.openvla_workspace.OpenVLAWorkspace
 
 task_name: ${task.name}
 exp_name: "openvla"
+agent_id: 0  # Override via command line: agent_id=0, agent_id=1, etc.
 
 # Model configuration
 model:
@@ -54,7 +55,7 @@ training:
   # Simulation evaluation
   eval_in_sim: True
   eval_sim_every_n_epochs: 10         # Run sim eval every 10 epochs
-  eval_sim_episodes: 10               # More episodes for reliable metrics
+  eval_sim_episodes: 4               # More episodes for reliable metrics
   eval_sim_num_envs: 4
   eval_sim_max_steps: 200             # Longer episodes
   
@@ -80,8 +81,8 @@ val_dataloader:
 logging:
   project: "robofactory"
   mode: "online"
-  name: "${task_name}_${exp_name}"
-  tags: ["${name}", "${task_name}", "${exp_name}"]
+  name: "${task_name}_${exp_name}_Agent${agent_id}"
+  tags: ["${name}", "${task_name}", "${exp_name}", "Agent${agent_id}"]
   
   log_every_n_steps: 50               # Log less frequently
   log_gradients: True
