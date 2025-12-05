@@ -176,10 +176,12 @@ def main(load_num, task_name, agent_num):
         res = dataset.__getitem__(i)
         for agent_id in range(agent_num + 1):
             base_dir = f"data/pkl_data/{task_name}" + "_Agent" + str(agent_id)
-            camera_name = "head_camera_agent" + str(agent_id)
+            head_camera_name = "head_camera_agent" + str(agent_id)
+            wrist_camera_name = "wrist_camera_agent" + str(agent_id)
             if agent_id == agent_num:
                 base_dir = f"data/pkl_data/{task_name}" + "_global"
-                camera_name = "head_camera_global"
+                head_camera_name = "head_camera_global"
+                wrist_camera_name = None  # Global doesn't have wrist camera
             # for every episode, make a dir to save the episode data
             episode_dir = f"{base_dir}/episode{i}"
             os.makedirs(episode_dir, exist_ok=True)
@@ -189,18 +191,28 @@ def main(load_num, task_name, agent_num):
             else:
                 action_len = len(res["action"])
             
-            if (action_len != len(res["obs"]["sensor_data"][camera_name]["rgb"])):
+            if (action_len != len(res["obs"]["sensor_data"][head_camera_name]["rgb"])):
                 print("action length not equal to obs length")
                 print("action length", action_len)
-                print("obs length", len(res["obs"]["sensor_data"][camera_name]["rgb"]))
-            min_len = min(action_len, len(res["obs"]["sensor_data"][camera_name]["rgb"]))
+                print("obs length", len(res["obs"]["sensor_data"][head_camera_name]["rgb"]))
+            min_len = min(action_len, len(res["obs"]["sensor_data"][head_camera_name]["rgb"]))
             for j in range(min_len):
                 obs_dict = {}
+                # Head camera (side view, fixed position)
                 obs_dict["head_camera"] = {}
-                obs_dict["head_camera"]["rgb"] = res["obs"]["sensor_data"][camera_name]["rgb"][j]
-                obs_dict["head_camera"]["intrinsic_cv"] = res["obs"]["sensor_param"][camera_name]["intrinsic_cv"][j]
-                obs_dict["head_camera"]["extrinsic_cv"] = res["obs"]["sensor_param"][camera_name]["extrinsic_cv"][j]
-                obs_dict["head_camera"]["cam2world_gl"] = res["obs"]["sensor_param"][camera_name]["cam2world_gl"][j]
+                obs_dict["head_camera"]["rgb"] = res["obs"]["sensor_data"][head_camera_name]["rgb"][j]
+                obs_dict["head_camera"]["intrinsic_cv"] = res["obs"]["sensor_param"][head_camera_name]["intrinsic_cv"][j]
+                obs_dict["head_camera"]["extrinsic_cv"] = res["obs"]["sensor_param"][head_camera_name]["extrinsic_cv"][j]
+                obs_dict["head_camera"]["cam2world_gl"] = res["obs"]["sensor_param"][head_camera_name]["cam2world_gl"][j]
+                
+                # Wrist camera (mounted on robot end-effector) - only for agents, not global
+                if wrist_camera_name is not None and wrist_camera_name in res["obs"]["sensor_data"]:
+                    obs_dict["wrist_camera"] = {}
+                    obs_dict["wrist_camera"]["rgb"] = res["obs"]["sensor_data"][wrist_camera_name]["rgb"][j]
+                    obs_dict["wrist_camera"]["intrinsic_cv"] = res["obs"]["sensor_param"][wrist_camera_name]["intrinsic_cv"][j]
+                    obs_dict["wrist_camera"]["extrinsic_cv"] = res["obs"]["sensor_param"][wrist_camera_name]["extrinsic_cv"][j]
+                    obs_dict["wrist_camera"]["cam2world_gl"] = res["obs"]["sensor_param"][wrist_camera_name]["cam2world_gl"][j]
+                
                 if agent_id == agent_num:
                     step_data = dict(
                         pointcloud=None,

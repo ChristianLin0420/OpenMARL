@@ -41,23 +41,43 @@ def load_statistics(data_dir: Path) -> Dict:
 
 
 def load_episodes(data_dir: Path) -> List[List[Dict]]:
-    """Load all episodes from TFRecord file."""
+    """Load all episodes from TFRecord file with multiple camera views."""
     tfrecord_path = data_dir / 'train.tfrecord'
     
     if not tfrecord_path.exists():
         raise FileNotFoundError(f"TFRecord file not found: {tfrecord_path}")
     
-    # Feature description for parsing
+    # First pass: detect available features
+    dataset = tf.data.TFRecordDataset(str(tfrecord_path))
+    sample_record = next(iter(dataset))
+    example = tf.train.Example()
+    example.ParseFromString(sample_record.numpy())
+    available_features = set(example.features.feature.keys())
+    
+    # Build feature description based on available features
     feature_description = {
-        'action': tf.io.VarLenFeature(tf.float32),
         'is_first': tf.io.FixedLenFeature([], tf.int64),
         'is_last': tf.io.FixedLenFeature([], tf.int64),
         'is_terminal': tf.io.FixedLenFeature([], tf.int64),
         'language_instruction': tf.io.FixedLenFeature([], tf.string),
-        'observation/image': tf.io.FixedLenFeature([], tf.string),
-        'observation/proprio': tf.io.VarLenFeature(tf.float32),
     }
     
+    # Optional features
+    if 'action' in available_features:
+        feature_description['action'] = tf.io.VarLenFeature(tf.float32)
+    if 'observation/proprio' in available_features:
+        feature_description['observation/proprio'] = tf.io.VarLenFeature(tf.float32)
+    
+    # Camera observations - check for all possible camera types
+    camera_keys = []
+    for key in ['observation/image', 'observation/wrist_image', 'observation/side_image', 'observation/global_image']:
+        if key in available_features:
+            feature_description[key] = tf.io.FixedLenFeature([], tf.string)
+            camera_keys.append(key)
+    
+    print(f"Detected cameras: {camera_keys}")
+    
+    # Parse dataset
     dataset = tf.data.TFRecordDataset(str(tfrecord_path))
     
     episodes = []
@@ -67,25 +87,42 @@ def load_episodes(data_dir: Path) -> List[List[Dict]]:
         example = tf.io.parse_single_example(raw_record, feature_description)
         
         # Decode data
-        action = tf.sparse.to_dense(example['action']).numpy().astype(np.float32)
-        proprio = tf.sparse.to_dense(example['observation/proprio']).numpy().astype(np.float32)
-        image = tf.io.decode_png(example['observation/image'].numpy()).numpy()
-        instruction = example['language_instruction'].numpy().decode('utf-8')
-        is_first = bool(example['is_first'].numpy())
-        is_last = bool(example['is_last'].numpy())
-        
         step = {
-            'image': image,
-            'proprio': proprio,
-            'action': action,
-            'instruction': instruction,
-            'is_first': is_first,
-            'is_last': is_last,
+            'instruction': example['language_instruction'].numpy().decode('utf-8'),
+            'is_first': bool(example['is_first'].numpy()),
+            'is_last': bool(example['is_last'].numpy()),
         }
+        
+        # Decode action if available
+        if 'action' in feature_description:
+            step['action'] = tf.sparse.to_dense(example['action']).numpy().astype(np.float32)
+        else:
+            step['action'] = np.array([])
+        
+        # Decode proprio if available
+        if 'observation/proprio' in feature_description:
+            step['proprio'] = tf.sparse.to_dense(example['observation/proprio']).numpy().astype(np.float32)
+        else:
+            step['proprio'] = np.array([])
+        
+        # Decode all available camera images
+        for key in camera_keys:
+            short_key = key.replace('observation/', '')
+            step[short_key] = tf.io.decode_png(example[key].numpy()).numpy()
+        
+        # Set default 'image' key for backward compatibility
+        if 'wrist_image' in step:
+            step['image'] = step['wrist_image']
+        elif 'side_image' in step:
+            step['image'] = step['side_image']
+        elif 'global_image' in step:
+            step['image'] = step['global_image']
+        elif 'image' in step:
+            pass  # Already set
         
         current_episode.append(step)
         
-        if is_last:
+        if step['is_last']:
             episodes.append(current_episode)
             current_episode = []
     
@@ -115,8 +152,16 @@ def print_dataset_summary(data_dir: Path, episodes: List, info: Dict, stats: Dic
         print(f"   Episode length - Min: {min(ep_lengths)}, Max: {max(ep_lengths)}, Avg: {np.mean(ep_lengths):.1f}")
         
         sample = episodes[0][0]
-        print(f"\n🖼️  Image shape: {sample['image'].shape}")
-        print(f"🎮 Action dim: {len(sample['action'])}")
+        
+        # Show available cameras
+        camera_keys = ['wrist_image', 'side_image', 'global_image', 'image']
+        available_cameras = [k for k in camera_keys if k in sample and sample[k] is not None]
+        print(f"\n📷 Available Cameras:")
+        for cam in available_cameras:
+            if cam in sample:
+                print(f"   {cam}: shape {sample[cam].shape}")
+        
+        print(f"\n🎮 Action dim: {len(sample['action'])}")
         print(f"🤖 Proprio dim: {len(sample['proprio'])}")
         print(f"📝 Instruction: \"{sample['instruction']}\"")
     
@@ -249,8 +294,18 @@ def visualize_action_distribution(episodes: List):
     plt.show()
 
 
-def save_episode_video(episodes: List, episode_idx: int, output_path: str, fps: int = 10):
-    """Save episode as video file."""
+def save_episode_video(episodes: List, episode_idx: int, output_path: str, fps: int = 10, 
+                       camera_view: str = 'all'):
+    """
+    Save episode as video file.
+    
+    Args:
+        episodes: List of episodes
+        episode_idx: Episode index to save
+        output_path: Output path for video
+        fps: Frames per second
+        camera_view: 'all' for side-by-side, or specific camera ('wrist_image', 'side_image', 'global_image')
+    """
     try:
         import cv2
     except ImportError:
@@ -262,21 +317,61 @@ def save_episode_video(episodes: List, episode_idx: int, output_path: str, fps: 
         return
     
     episode = episodes[episode_idx]
+    sample_step = episode[0]
     
-    # Get image dimensions
-    sample_img = episode[0]['image']
-    height, width = sample_img.shape[:2]
+    # Detect available cameras
+    camera_keys = ['wrist_image', 'side_image', 'global_image']
+    available_cameras = [k for k in camera_keys if k in sample_step and sample_step[k] is not None]
     
-    # Create video writer
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+    # Fallback to default 'image' if no specific cameras
+    if not available_cameras and 'image' in sample_step:
+        available_cameras = ['image']
     
-    for step in episode:
-        frame = cv2.cvtColor(step['image'], cv2.COLOR_RGB2BGR)
-        out.write(frame)
-    
-    out.release()
-    print(f"Saved video to: {output_path}")
+    if camera_view != 'all' and camera_view in available_cameras:
+        # Single camera view
+        sample_img = sample_step[camera_view]
+        height, width = sample_img.shape[:2]
+        
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+        
+        for step in episode:
+            frame = cv2.cvtColor(step[camera_view], cv2.COLOR_RGB2BGR)
+            out.write(frame)
+        
+        out.release()
+        print(f"Saved {camera_view} video to: {output_path}")
+    else:
+        # All cameras side by side
+        if len(available_cameras) == 0:
+            print("No camera views available in the dataset.")
+            return
+        
+        # Get dimensions for combined frame
+        sample_img = sample_step[available_cameras[0]]
+        height, width = sample_img.shape[:2]
+        combined_width = width * len(available_cameras)
+        
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        out = cv2.VideoWriter(output_path, fourcc, fps, (combined_width, height))
+        
+        for step in episode:
+            frames = []
+            for cam in available_cameras:
+                if cam in step:
+                    frame = cv2.cvtColor(step[cam], cv2.COLOR_RGB2BGR)
+                    # Add camera label
+                    label = cam.replace('_image', '').replace('_', ' ').title()
+                    cv2.putText(frame, label, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 
+                               0.7, (255, 255, 255), 2)
+                    frames.append(frame)
+            
+            if frames:
+                combined = np.hstack(frames)
+                out.write(combined)
+        
+        out.release()
+        print(f"Saved combined video ({', '.join(available_cameras)}) to: {output_path}")
 
 
 def main():
@@ -295,6 +390,9 @@ def main():
                         help='Save episode as video')
     parser.add_argument('--video_fps', type=int, default=10,
                         help='Video FPS (default: 10)')
+    parser.add_argument('--camera_view', type=str, default='all',
+                        choices=['all', 'wrist_image', 'side_image', 'global_image'],
+                        help='Camera view for video: all (side-by-side), wrist_image (gripper), side_image, or global_image')
     parser.add_argument('--summary_only', action='store_true',
                         help='Only print dataset summary, no visualization')
     
@@ -327,7 +425,7 @@ def main():
     
     if args.save_video:
         video_path = str(data_dir / f'episode_{args.episode}.mp4')
-        save_episode_video(episodes, args.episode, video_path, args.video_fps)
+        save_episode_video(episodes, args.episode, video_path, args.video_fps, args.camera_view)
     
     # Always show single episode visualization unless summary_only
     if not args.summary_only:

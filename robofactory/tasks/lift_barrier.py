@@ -12,7 +12,7 @@ from mani_skill.agents.robots import Fetch, Panda
 from mani_skill.envs.sapien_env import BaseEnv
 from mani_skill.agents.multi_agent import MultiAgent
 from mani_skill.envs.utils import randomization
-from mani_skill.sensors.camera import CameraConfig
+from mani_skill.sensors.camera import CameraConfig, Camera
 from mani_skill.utils import common, sapien_utils
 from mani_skill.utils.building import actors
 from mani_skill.utils.registration import register_env
@@ -108,6 +108,71 @@ class LiftBarrierEnv(BaseEnv):
         scene_builder = getattr(scene_rf, f'{scene_name}SceneBuilder')
         self.scene_builder = scene_builder(env=self, cfg=cfg)
         self.scene_builder.build()
+
+    def _setup_sensors(self, options: dict):
+        """Override to add wrist cameras as proper sensors during setup."""
+        # Call parent to set up default sensors
+        super()._setup_sensors(options)
+        
+        # Now add wrist cameras for each agent
+        agent_count = len(self.cfg.get('agents', []))
+        
+        for agent_id in range(agent_count):
+            # Handle both list and dict agent structures
+            robot = None
+            if hasattr(self.agent, 'agents'):
+                agents = self.agent.agents
+                if isinstance(agents, list) and agent_id < len(agents):
+                    robot = agents[agent_id].robot
+                elif isinstance(agents, dict):
+                    agent_key = f'panda-{agent_id}'
+                    if agent_key in agents:
+                        robot = agents[agent_key].robot
+            elif hasattr(self.agent, 'robot'):
+                robot = self.agent.robot
+            
+            if robot is None:
+                continue
+            
+            # Find the hand link (end-effector)
+            ee_link = None
+            for link in robot.get_links():
+                if link.name == 'panda_hand':
+                    ee_link = link
+                    break
+            
+            if ee_link is not None:
+                camera_uid = f"wrist_camera_agent{agent_id}"
+                
+                # Camera pose relative to end-effector
+                # Looking forward from gripper
+                cam_pose = sapien.Pose(
+                    p=[0.05, 0, 0.04],  # 5cm forward, 4cm up from hand
+                    q=[0, 0.707, 0, 0.707]  # Rotate to look forward
+                )
+                
+                # Create CameraConfig for this wrist camera
+                wrist_cam_config = CameraConfig(
+                    uid=camera_uid,
+                    pose=cam_pose,
+                    width=320,
+                    height=240,
+                    near=0.01,
+                    far=10,
+                    fov=1.5707963268,
+                    mount=ee_link,
+                )
+                
+                # Create Camera sensor and add to sensors dict
+                wrist_camera = Camera(
+                    wrist_cam_config,
+                    self.scene,
+                    articulation=robot,
+                )
+                self._sensors[camera_uid] = wrist_camera
+        
+        # Update scene sensors reference
+        self.scene.sensors = self._sensors
 
     def _initialize_episode(self, env_idx: torch.Tensor, options: dict):
         with torch.device(self.device):

@@ -174,12 +174,24 @@ def main(load_num, task_name):
         os.makedirs(episode_dir, exist_ok=True)
         for j in range(len(res["action"])):
             obs_dict = {}
-            camera_name = "head_camera"
-            obs_dict[camera_name] = {}
-            obs_dict[camera_name]["rgb"] = res["obs"]["sensor_data"][camera_name]["rgb"][j]
-            obs_dict[camera_name]["intrinsic_cv"] = res["obs"]["sensor_param"][camera_name]["intrinsic_cv"][j]
-            obs_dict[camera_name]["extrinsic_cv"] = res["obs"]["sensor_param"][camera_name]["extrinsic_cv"][j]
-            obs_dict[camera_name]["cam2world_gl"] = res["obs"]["sensor_param"][camera_name]["cam2world_gl"][j]
+            
+            # Head camera (side view, fixed position)
+            head_camera_name = "head_camera"
+            obs_dict[head_camera_name] = {}
+            obs_dict[head_camera_name]["rgb"] = res["obs"]["sensor_data"][head_camera_name]["rgb"][j]
+            obs_dict[head_camera_name]["intrinsic_cv"] = res["obs"]["sensor_param"][head_camera_name]["intrinsic_cv"][j]
+            obs_dict[head_camera_name]["extrinsic_cv"] = res["obs"]["sensor_param"][head_camera_name]["extrinsic_cv"][j]
+            obs_dict[head_camera_name]["cam2world_gl"] = res["obs"]["sensor_param"][head_camera_name]["cam2world_gl"][j]
+            
+            # Wrist camera (mounted on robot end-effector) - check if exists
+            wrist_camera_name = "wrist_camera_agent0"
+            if wrist_camera_name in res["obs"]["sensor_data"]:
+                obs_dict["wrist_camera"] = {}
+                obs_dict["wrist_camera"]["rgb"] = res["obs"]["sensor_data"][wrist_camera_name]["rgb"][j]
+                obs_dict["wrist_camera"]["intrinsic_cv"] = res["obs"]["sensor_param"][wrist_camera_name]["intrinsic_cv"][j]
+                obs_dict["wrist_camera"]["extrinsic_cv"] = res["obs"]["sensor_param"][wrist_camera_name]["extrinsic_cv"][j]
+                obs_dict["wrist_camera"]["cam2world_gl"] = res["obs"]["sensor_param"][wrist_camera_name]["cam2world_gl"][j]
+            
             step_data = dict(
                 pointcloud=None,
                 joint_action=res["action"][j],

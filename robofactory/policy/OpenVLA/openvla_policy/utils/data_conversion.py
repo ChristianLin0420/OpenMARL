@@ -96,18 +96,41 @@ def create_dataset_statistics(
     return statistics
 
 
+def _process_image(image: np.ndarray) -> np.ndarray:
+    """
+    Process image to ensure correct format (HWC, uint8).
+    
+    Args:
+        image: Input image array
+        
+    Returns:
+        Processed image in HWC uint8 format
+    """
+    # Ensure image is in HWC format (H, W, C)
+    if len(image.shape) == 3 and image.shape[0] == 3:
+        # Convert from CHW to HWC
+        image = np.transpose(image, (1, 2, 0))
+    # Ensure image is uint8
+    if image.dtype != np.uint8:
+        if image.max() <= 1.0:
+            image = (image * 255).astype(np.uint8)
+        else:
+            image = image.astype(np.uint8)
+    return image
+
+
 def convert_zarr_to_rlds(
     zarr_path: str,
     output_dir: str,
     task_name: str,
     agent_id: int,
     language_instruction: Optional[str] = None,
-    image_key: str = 'head_camera',
     action_key: str = 'action',
     state_key: str = 'state'
 ) -> str:
     """
     Convert ZARR dataset to RLDS format for OpenVLA.
+    Includes both wrist_camera (gripper view) and head_camera (side view).
     
     Args:
         zarr_path: Path to input ZARR dataset
@@ -115,7 +138,6 @@ def convert_zarr_to_rlds(
         task_name: Name of the task
         agent_id: Agent ID
         language_instruction: Optional language instruction for the task
-        image_key: Key for camera images
         action_key: Key for actions
         state_key: Key for robot state/proprio
         
@@ -125,6 +147,12 @@ def convert_zarr_to_rlds(
     # Load ZARR data
     print(f"Loading ZARR data from {zarr_path}...")
     data = load_zarr_data(zarr_path)
+    
+    # Check available cameras
+    has_wrist_camera = 'wrist_camera' in data
+    has_head_camera = 'head_camera' in data
+    
+    print(f"Available cameras - wrist_camera (gripper): {has_wrist_camera}, head_camera (side): {has_head_camera}")
     
     # Get episode boundaries
     episode_ends = data.get('episode_ends', None)
@@ -164,20 +192,21 @@ def convert_zarr_to_rlds(
                 'language_instruction': language_instruction,
             }
             
-            # Add image observation
-            if image_key in data:
-                image = data[image_key][step_idx]
-                # Ensure image is in HWC format (H, W, C)
-                if len(image.shape) == 3 and image.shape[0] == 3:
-                    # Convert from CHW to HWC
-                    image = np.transpose(image, (1, 2, 0))
-                # Ensure image is uint8
-                if image.dtype != np.uint8:
-                    if image.max() <= 1.0:
-                        image = (image * 255).astype(np.uint8)
-                    else:
-                        image = image.astype(np.uint8)
-                step['observation']['image'] = image
+            # Add wrist_camera (gripper view) as primary image
+            if has_wrist_camera:
+                wrist_image = _process_image(data['wrist_camera'][step_idx])
+                step['observation']['wrist_image'] = wrist_image
+            
+            # Add head_camera (side view) as secondary image
+            if has_head_camera:
+                head_image = _process_image(data['head_camera'][step_idx])
+                step['observation']['side_image'] = head_image
+            
+            # For backward compatibility, also set 'image' to wrist if available, else head
+            if has_wrist_camera:
+                step['observation']['image'] = step['observation']['wrist_image']
+            elif has_head_camera:
+                step['observation']['image'] = step['observation']['side_image']
             
             # Add proprio/state observation
             if state_key in data:
@@ -195,6 +224,12 @@ def convert_zarr_to_rlds(
     _save_episodes_as_tfrecord(episodes, tfrecord_path)
     
     # Create dataset_info.json
+    camera_info = []
+    if has_wrist_camera:
+        camera_info.append('wrist_image (gripper view)')
+    if has_head_camera:
+        camera_info.append('side_image (side view)')
+    
     info = {
         'name': dataset_name,
         'version': '1.0.0',
@@ -202,6 +237,9 @@ def convert_zarr_to_rlds(
         'num_episodes': len(episodes),
         'num_transitions': int(episode_ends[-1]),
         'action_dim': data[action_key].shape[-1],
+        'cameras': camera_info,
+        'has_wrist_camera': has_wrist_camera,
+        'has_side_camera': has_head_camera,
     }
     
     info_path = os.path.join(output_path, 'dataset_info.json')
@@ -212,9 +250,160 @@ def convert_zarr_to_rlds(
     return output_path
 
 
+def convert_zarr_to_rlds_global(
+    zarr_path: str,
+    output_dir: str,
+    task_name: str,
+    language_instruction: Optional[str] = None,
+    image_key: str = 'head_camera',
+) -> str:
+    """
+    Convert global camera ZARR dataset to RLDS format.
+    Global camera data has no actions, only observations.
+    
+    Args:
+        zarr_path: Path to input ZARR dataset
+        output_dir: Directory to save RLDS dataset
+        task_name: Name of the task
+        language_instruction: Optional language instruction for the task
+        image_key: Key for camera images
+        
+    Returns:
+        Path to created RLDS dataset
+    """
+    # Load ZARR data
+    print(f"Loading global ZARR data from {zarr_path}...")
+    data = load_zarr_data(zarr_path)
+    
+    # Get episode boundaries
+    episode_ends = data.get('episode_ends', None)
+    if episode_ends is None:
+        # Assume single episode if no episode_ends
+        total_steps = len(data[image_key])
+        episode_ends = np.array([total_steps])
+    
+    # Prepare output directory
+    dataset_name = f"{task_name}_global"
+    output_path = os.path.join(output_dir, dataset_name)
+    os.makedirs(output_path, exist_ok=True)
+    
+    # Set default language instruction if not provided
+    if language_instruction is None:
+        language_instruction = f"Observe the {task_name.replace('-rf', '')} task from global view"
+    
+    print(f"Converting {len(episode_ends)} episodes to RLDS format (global view)...")
+    
+    # Create RLDS dataset builder
+    episodes = []
+    start_idx = 0
+    
+    for ep_idx, end_idx in enumerate(tqdm(episode_ends, desc="Converting episodes")):
+        episode_data = {
+            'steps': []
+        }
+        
+        # Extract episode data
+        for step_idx in range(start_idx, end_idx):
+            step = {
+                'observation': {},
+                'is_first': step_idx == start_idx,
+                'is_last': step_idx == end_idx - 1,
+                'is_terminal': step_idx == end_idx - 1,
+                'language_instruction': language_instruction,
+            }
+            
+            # Add global image observation
+            if image_key in data:
+                image = _process_image(data[image_key][step_idx])
+                step['observation']['global_image'] = image
+                step['observation']['image'] = image  # backward compatibility
+            
+            episode_data['steps'].append(step)
+        
+        episodes.append(episode_data)
+        start_idx = end_idx
+    
+    # Save as TFRecord format (RLDS compatible)
+    tfrecord_path = os.path.join(output_path, 'train.tfrecord')
+    
+    print(f"Saving to TFRecord format at {tfrecord_path}...")
+    _save_episodes_as_tfrecord_global(episodes, tfrecord_path)
+    
+    # Create dataset_info.json
+    info = {
+        'name': dataset_name,
+        'version': '1.0.0',
+        'description': f'RoboFactory task {task_name} global camera view',
+        'num_episodes': len(episodes),
+        'num_transitions': int(episode_ends[-1]),
+        'is_global_view': True,
+        'cameras': ['global_image (global overhead view)'],
+        'has_actions': False,
+    }
+    
+    info_path = os.path.join(output_path, 'dataset_info.json')
+    with open(info_path, 'w') as f:
+        json.dump(info, f, indent=2)
+    
+    print(f"Successfully converted global dataset to {output_path}")
+    return output_path
+
+
+def _save_episodes_as_tfrecord_global(episodes: List[Dict], output_path: str):
+    """
+    Save global camera episodes as TFRecord format (no actions).
+    
+    Args:
+        episodes: List of episode dictionaries
+        output_path: Path to save TFRecord file
+    """
+    def _bytes_feature(value):
+        """Returns a bytes_list from a string / byte."""
+        if isinstance(value, type(tf.constant(0))):
+            value = value.numpy()
+        return tf.train.Feature(bytes_list=tf.train.BytesList(value=[value]))
+
+    def _int64_feature(value):
+        """Returns an int64_list from a bool / enum / int / uint."""
+        return tf.train.Feature(int64_list=tf.train.Int64List(value=[value]))
+
+    with tf.io.TFRecordWriter(output_path) as writer:
+        for episode in episodes:
+            for step in episode['steps']:
+                # Create feature dictionary (no action for global view)
+                feature = {
+                    'is_first': _int64_feature(int(step['is_first'])),
+                    'is_last': _int64_feature(int(step['is_last'])),
+                    'is_terminal': _int64_feature(int(step['is_terminal'])),
+                    'language_instruction': _bytes_feature(
+                        step['language_instruction'].encode('utf-8')
+                    ),
+                }
+                
+                # Add global camera image
+                if 'global_image' in step['observation']:
+                    global_image = step['observation']['global_image']
+                    feature['observation/global_image'] = _bytes_feature(
+                        tf.io.encode_png(global_image).numpy()
+                    )
+                
+                # Add backward compatible image key
+                if 'image' in step['observation']:
+                    image = step['observation']['image']
+                    feature['observation/image'] = _bytes_feature(
+                        tf.io.encode_png(image).numpy()
+                    )
+                
+                # Create Example and write
+                example = tf.train.Example(
+                    features=tf.train.Features(feature=feature)
+                )
+                writer.write(example.SerializeToString())
+
+
 def _save_episodes_as_tfrecord(episodes: List[Dict], output_path: str):
     """
-    Save episodes as TFRecord format.
+    Save episodes as TFRecord format with multiple camera views.
     
     Args:
         episodes: List of episode dictionaries
@@ -248,13 +437,28 @@ def _save_episodes_as_tfrecord(episodes: List[Dict], output_path: str):
                     ),
                 }
                 
-                # Add observations
+                # Add wrist camera (gripper view)
+                if 'wrist_image' in step['observation']:
+                    wrist_image = step['observation']['wrist_image']
+                    feature['observation/wrist_image'] = _bytes_feature(
+                        tf.io.encode_png(wrist_image).numpy()
+                    )
+                
+                # Add side camera (head_camera view)
+                if 'side_image' in step['observation']:
+                    side_image = step['observation']['side_image']
+                    feature['observation/side_image'] = _bytes_feature(
+                        tf.io.encode_png(side_image).numpy()
+                    )
+                
+                # Add default image (for backward compatibility)
                 if 'image' in step['observation']:
                     image = step['observation']['image']
                     feature['observation/image'] = _bytes_feature(
                         tf.io.encode_png(image).numpy()
                     )
                 
+                # Add proprio/state
                 if 'proprio' in step['observation']:
                     feature['observation/proprio'] = _float_feature(
                         step['observation']['proprio'].flatten()
