@@ -7,6 +7,9 @@ import os
 import pdb
 import pickle
 import argparse
+import multiprocessing as mp
+from functools import partial
+import gc
 
 from mani_skill.utils.io_utils import load_json
 from mani_skill.utils import sapien_utils
@@ -35,9 +38,10 @@ class ManiSkillTrajectoryDataset(Dataset):
         device: The location to save data to. If None will store as numpy (the default), otherwise will move data to that device
     """
 
-    def __init__(self, dataset_file: str, load_count=-1, success_only: bool = False, device = None) -> None:
+    def __init__(self, dataset_file: str, load_count=-1, success_only: bool = False, device = None, batch_size=None) -> None:
         self.dataset_file = dataset_file
         self.device = device
+        self.batch_size = batch_size  # If None, load all at once (original behavior)
         self.data = h5py.File(dataset_file, "r")
         json_path = dataset_file.replace(".h5", ".json")
         self.json_data = load_json(json_path)
@@ -53,7 +57,14 @@ class ManiSkillTrajectoryDataset(Dataset):
         self.success, self.fail, self.rewards = None, None, None
         if load_count == -1:
             load_count = len(self.episodes)
-
+        
+        self.total_episodes = load_count
+        
+        # If batch_size is specified, only load episode metadata, not data
+        if batch_size is not None:
+            return
+        
+        # Original behavior: load all episodes into memory
         for eps_id in tqdm(range(load_count)):
             eps = self.episodes[eps_id]
             if success_only: 
@@ -132,10 +143,47 @@ class ManiSkillTrajectoryDataset(Dataset):
                 self.fail = sapien_utils.to_tensor(self.truncated, device=device)
 
     def __len__(self):
+        if self.batch_size is not None:
+            return self.total_episodes
         return len(self.actions)
 
-    def __getitem__(self, idx):
+    def load_single_episode(self, idx):
+        """Load a single episode from h5 file without caching."""
+        eps = self.episodes[idx]
+        trajectory = self.data[f"traj_{eps['episode_id']}"]
+        trajectory = load_h5_data(trajectory)
+        eps_len = len(trajectory["actions"])
+        
+        obs = common.index_dict_array(trajectory["obs"], slice(eps_len))
+        action = trajectory["actions"]
+        terminated = trajectory["terminated"]
+        truncated = trajectory["truncated"]
+        
+        res = dict(
+            obs=obs,
+            action=action,
+            terminated=terminated,
+            truncated=truncated,
+        )
+        
+        if "rewards" in trajectory:
+            res.update(reward=trajectory["rewards"])
+        if "success" in trajectory:
+            res.update(success=trajectory["success"][-1])
+        if "fail" in trajectory:
+            res.update(fail=trajectory["fail"][-1])
+        
+        res.update(len_of_action=len(action))
+        res.update(len_of_success=1)
+        
+        return res
 
+    def __getitem__(self, idx):
+        # If using batch processing, load episode on-demand
+        if self.batch_size is not None:
+            return self.load_single_episode(idx)
+        
+        # Original behavior: access pre-loaded data
         # pdb.set_trace()
         action = self.actions[idx]
         obs = common.index_dict_array(self.obs, idx, inplace=False)
@@ -162,49 +210,177 @@ class ManiSkillTrajectoryDataset(Dataset):
             len_of_success=len(self.success),
         )
         return res
+
+def process_episode(args):
+    """Process a single episode and save to pkl files.
+    This function is designed for parallel processing with multiprocessing.
+    """
+    episode_id, dataset_file, task_name = args
     
-def main(load_num, task_name):
-    dataset = ManiSkillTrajectoryDataset(dataset_file=f"data/h5_data/{task_name}.h5", load_count=load_num)
-    print("--Successfully loading dataset--")
-    for i in range(load_num):
-        res = dataset.__getitem__(i)
-        # for every episode, make a dir to save the episode data
-        base_dir = f"data/pkl_data/{task_name}"
-        episode_dir = f"{base_dir}/episode{i}"
-        os.makedirs(episode_dir, exist_ok=True)
-        for j in range(len(res["action"])):
-            obs_dict = {}
+    # Open h5 file in this process
+    data = h5py.File(dataset_file, "r")
+    json_path = dataset_file.replace(".h5", ".json")
+    json_data = load_json(json_path)
+    episodes = json_data["episodes"]
+    
+    eps = episodes[episode_id]
+    trajectory = data[f"traj_{eps['episode_id']}"]
+    trajectory = load_h5_data(trajectory)
+    
+    eps_len = len(trajectory["actions"])
+    obs = common.index_dict_array(trajectory["obs"], slice(eps_len))
+    action = trajectory["actions"]
+    
+    # Prepare result similar to __getitem__
+    res = dict(
+        obs=obs,
+        action=action,
+    )
+    
+    # Create episode directory
+    base_dir = f"data/pkl_data/{task_name}"
+    episode_dir = f"{base_dir}/episode{episode_id}"
+    os.makedirs(episode_dir, exist_ok=True)
+    
+    # Process and save each step
+    for j in range(len(res["action"])):
+        obs_dict = {}
+        
+        # Head camera (side view, fixed position)
+        head_camera_name = "head_camera"
+        obs_dict[head_camera_name] = {}
+        obs_dict[head_camera_name]["rgb"] = res["obs"]["sensor_data"][head_camera_name]["rgb"][j]
+        obs_dict[head_camera_name]["intrinsic_cv"] = res["obs"]["sensor_param"][head_camera_name]["intrinsic_cv"][j]
+        obs_dict[head_camera_name]["extrinsic_cv"] = res["obs"]["sensor_param"][head_camera_name]["extrinsic_cv"][j]
+        obs_dict[head_camera_name]["cam2world_gl"] = res["obs"]["sensor_param"][head_camera_name]["cam2world_gl"][j]
+        
+        # Wrist camera (mounted on robot end-effector) - check if exists
+        wrist_camera_name = "wrist_camera_agent0"
+        if wrist_camera_name in res["obs"]["sensor_data"]:
+            obs_dict["wrist_camera"] = {}
+            obs_dict["wrist_camera"]["rgb"] = res["obs"]["sensor_data"][wrist_camera_name]["rgb"][j]
+            obs_dict["wrist_camera"]["intrinsic_cv"] = res["obs"]["sensor_param"][wrist_camera_name]["intrinsic_cv"][j]
+            obs_dict["wrist_camera"]["extrinsic_cv"] = res["obs"]["sensor_param"][wrist_camera_name]["extrinsic_cv"][j]
+            obs_dict["wrist_camera"]["cam2world_gl"] = res["obs"]["sensor_param"][wrist_camera_name]["cam2world_gl"][j]
+        
+        step_data = dict(
+            pointcloud=None,
+            joint_action=res["action"][j],
+            endpose=res["action"][j],
+            observation=obs_dict,
+        )
+        with open(f"{episode_dir}/{j}.pkl", "wb") as f:
+            pickle.dump(step_data, f)
+    
+    data.close()
+    gc.collect()  # Force garbage collection to free memory
+    
+    return episode_id
+
+def main(load_num, task_name, batch_size=5, num_workers=16):
+    """
+    Main function with batch processing and parallel processing support.
+    
+    Args:
+        load_num: Number of episodes to process
+        task_name: Name of the task
+        batch_size: Number of episodes to process in each batch (to avoid OOM)
+        num_workers: Number of parallel workers for processing
+    """
+    dataset_file = f"data/h5_data/{task_name}.h5"
+    
+    print(f"Processing {load_num} episodes with batch_size={batch_size} and {num_workers} workers")
+    
+    if num_workers > 1:
+        # Parallel processing mode
+        print("Using parallel processing mode")
+        
+        # Prepare arguments for all episodes
+        episode_args = [(i, dataset_file, task_name) for i in range(load_num)]
+        
+        # Process in batches to avoid OOM
+        for batch_start in range(0, load_num, batch_size):
+            batch_end = min(batch_start + batch_size, load_num)
+            batch_args = episode_args[batch_start:batch_end]
             
-            # Head camera (side view, fixed position)
-            head_camera_name = "head_camera"
-            obs_dict[head_camera_name] = {}
-            obs_dict[head_camera_name]["rgb"] = res["obs"]["sensor_data"][head_camera_name]["rgb"][j]
-            obs_dict[head_camera_name]["intrinsic_cv"] = res["obs"]["sensor_param"][head_camera_name]["intrinsic_cv"][j]
-            obs_dict[head_camera_name]["extrinsic_cv"] = res["obs"]["sensor_param"][head_camera_name]["extrinsic_cv"][j]
-            obs_dict[head_camera_name]["cam2world_gl"] = res["obs"]["sensor_param"][head_camera_name]["cam2world_gl"][j]
+            print(f"\nProcessing batch {batch_start//batch_size + 1}/{(load_num + batch_size - 1)//batch_size}")
+            print(f"Episodes {batch_start} to {batch_end-1}")
             
-            # Wrist camera (mounted on robot end-effector) - check if exists
-            wrist_camera_name = "wrist_camera_agent0"
-            if wrist_camera_name in res["obs"]["sensor_data"]:
-                obs_dict["wrist_camera"] = {}
-                obs_dict["wrist_camera"]["rgb"] = res["obs"]["sensor_data"][wrist_camera_name]["rgb"][j]
-                obs_dict["wrist_camera"]["intrinsic_cv"] = res["obs"]["sensor_param"][wrist_camera_name]["intrinsic_cv"][j]
-                obs_dict["wrist_camera"]["extrinsic_cv"] = res["obs"]["sensor_param"][wrist_camera_name]["extrinsic_cv"][j]
-                obs_dict["wrist_camera"]["cam2world_gl"] = res["obs"]["sensor_param"][wrist_camera_name]["cam2world_gl"][j]
+            # Use multiprocessing pool for parallel processing
+            with mp.Pool(processes=min(num_workers, len(batch_args))) as pool:
+                results = list(tqdm(
+                    pool.imap(process_episode, batch_args),
+                    total=len(batch_args),
+                    desc=f"Batch {batch_start//batch_size + 1}"
+                ))
             
-            step_data = dict(
-                pointcloud=None,
-                joint_action=res["action"][j],
-                endpose=res["action"][j],
-                observation=obs_dict,
-            )
-            with open(f"{episode_dir}/{j}.pkl", "wb") as f:
-                pickle.dump(step_data, f)
+            # Force garbage collection after each batch
+            gc.collect()
+            print(f"Completed episodes {batch_start} to {batch_end-1}")
+    else:
+        # Sequential processing mode with batch loading
+        print("Using sequential processing mode with batch loading")
+        dataset = ManiSkillTrajectoryDataset(
+            dataset_file=dataset_file, 
+            load_count=load_num,
+            batch_size=batch_size  # Enable on-demand loading
+        )
+        print("--Successfully initialized dataset--")
+        
+        for i in tqdm(range(load_num), desc="Processing episodes"):
+            res = dataset.__getitem__(i)
+            
+            # Create episode directory
+            base_dir = f"data/pkl_data/{task_name}"
+            episode_dir = f"{base_dir}/episode{i}"
+            os.makedirs(episode_dir, exist_ok=True)
+            
+            # Process and save each step
+            for j in range(len(res["action"])):
+                obs_dict = {}
+                
+                # Head camera (side view, fixed position)
+                head_camera_name = "head_camera"
+                obs_dict[head_camera_name] = {}
+                obs_dict[head_camera_name]["rgb"] = res["obs"]["sensor_data"][head_camera_name]["rgb"][j]
+                obs_dict[head_camera_name]["intrinsic_cv"] = res["obs"]["sensor_param"][head_camera_name]["intrinsic_cv"][j]
+                obs_dict[head_camera_name]["extrinsic_cv"] = res["obs"]["sensor_param"][head_camera_name]["extrinsic_cv"][j]
+                obs_dict[head_camera_name]["cam2world_gl"] = res["obs"]["sensor_param"][head_camera_name]["cam2world_gl"][j]
+                
+                # Wrist camera (mounted on robot end-effector) - check if exists
+                wrist_camera_name = "wrist_camera_agent0"
+                if wrist_camera_name in res["obs"]["sensor_data"]:
+                    obs_dict["wrist_camera"] = {}
+                    obs_dict["wrist_camera"]["rgb"] = res["obs"]["sensor_data"][wrist_camera_name]["rgb"][j]
+                    obs_dict["wrist_camera"]["intrinsic_cv"] = res["obs"]["sensor_param"][wrist_camera_name]["intrinsic_cv"][j]
+                    obs_dict["wrist_camera"]["extrinsic_cv"] = res["obs"]["sensor_param"][wrist_camera_name]["extrinsic_cv"][j]
+                    obs_dict["wrist_camera"]["cam2world_gl"] = res["obs"]["sensor_param"][wrist_camera_name]["cam2world_gl"][j]
+                
+                step_data = dict(
+                    pointcloud=None,
+                    joint_action=res["action"][j],
+                    endpose=res["action"][j],
+                    observation=obs_dict,
+                )
+                with open(f"{episode_dir}/{j}.pkl", "wb") as f:
+                    pickle.dump(step_data, f)
+            
+            # Periodically clean memory
+            if (i + 1) % batch_size == 0:
+                gc.collect()
+    
+    print("\n✓ All episodes processed successfully!")
     
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--task_name", type=str, required=True, help="Name of the task")
     parser.add_argument("--load_num", type=int, required=True, help="Number of trajectories to load")
+    parser.add_argument("--batch_size", type=int, default=5, help="Number of episodes to process in each batch (default: 5)")
+    parser.add_argument("--num_workers", type=int, default=16, help="Number of parallel workers (default: 16, set to 1 to disable parallelism)")
     args = parser.parse_args()
 
-    main(args.load_num, args.task_name)
+    # Set multiprocessing start method
+    if args.num_workers > 1:
+        mp.set_start_method('spawn', force=True)
+    
+    main(args.load_num, args.task_name, args.batch_size, args.num_workers)

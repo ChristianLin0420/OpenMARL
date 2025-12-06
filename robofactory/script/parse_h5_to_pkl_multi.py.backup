@@ -383,82 +383,82 @@ def main(load_num, task_name, agent_num, batch_size=5, num_workers=16):
         print("--Successfully initialized dataset--")
         
         for i in tqdm(range(load_num), desc="Processing episodes"):
-            res = dataset.__getitem__(i)
+        res = dataset.__getitem__(i)
             
-            for agent_id in range(agent_num + 1):
-                base_dir = f"data/pkl_data/{task_name}" + "_Agent" + str(agent_id)
-                head_camera_name = "head_camera_agent" + str(agent_id)
-                wrist_camera_name = "wrist_camera_agent" + str(agent_id)
-                if agent_id == agent_num:
-                    base_dir = f"data/pkl_data/{task_name}" + "_global"
-                    head_camera_name = "head_camera_global"
-                    wrist_camera_name = None  # Global doesn't have wrist camera
+        for agent_id in range(agent_num + 1):
+            base_dir = f"data/pkl_data/{task_name}" + "_Agent" + str(agent_id)
+            head_camera_name = "head_camera_agent" + str(agent_id)
+            wrist_camera_name = "wrist_camera_agent" + str(agent_id)
+            if agent_id == agent_num:
+                base_dir = f"data/pkl_data/{task_name}" + "_global"
+                head_camera_name = "head_camera_global"
+                wrist_camera_name = None  # Global doesn't have wrist camera
                 
-                # for every episode, make a dir to save the episode data
-                episode_dir = f"{base_dir}/episode{i}"
-                os.makedirs(episode_dir, exist_ok=True)
+            # for every episode, make a dir to save the episode data
+            episode_dir = f"{base_dir}/episode{i}"
+            os.makedirs(episode_dir, exist_ok=True)
                 
-                # Get action length - handle both dict and array structures
-                if isinstance(res["action"], dict):
-                    action_len = len(res["action"]["panda-0"])
-                else:
-                    action_len = len(res["action"])
-                
+            # Get action length - handle both dict and array structures
+            if isinstance(res["action"], dict):
+                action_len = len(res["action"]["panda-0"])
+            else:
+                action_len = len(res["action"])
+            
                 if head_camera_name not in res["obs"]["sensor_data"]:
                     continue
+            
+            if (action_len != len(res["obs"]["sensor_data"][head_camera_name]["rgb"])):
+                print("action length not equal to obs length")
+                print("action length", action_len)
+                print("obs length", len(res["obs"]["sensor_data"][head_camera_name]["rgb"]))
+            min_len = min(action_len, len(res["obs"]["sensor_data"][head_camera_name]["rgb"]))
                 
-                if (action_len != len(res["obs"]["sensor_data"][head_camera_name]["rgb"])):
-                    print("action length not equal to obs length")
-                    print("action length", action_len)
-                    print("obs length", len(res["obs"]["sensor_data"][head_camera_name]["rgb"]))
-                min_len = min(action_len, len(res["obs"]["sensor_data"][head_camera_name]["rgb"]))
+            for j in range(min_len):
+                obs_dict = {}
+                # Head camera (side view, fixed position)
+                obs_dict["head_camera"] = {}
+                obs_dict["head_camera"]["rgb"] = res["obs"]["sensor_data"][head_camera_name]["rgb"][j]
+                obs_dict["head_camera"]["intrinsic_cv"] = res["obs"]["sensor_param"][head_camera_name]["intrinsic_cv"][j]
+                obs_dict["head_camera"]["extrinsic_cv"] = res["obs"]["sensor_param"][head_camera_name]["extrinsic_cv"][j]
+                obs_dict["head_camera"]["cam2world_gl"] = res["obs"]["sensor_param"][head_camera_name]["cam2world_gl"][j]
                 
-                for j in range(min_len):
-                    obs_dict = {}
-                    # Head camera (side view, fixed position)
-                    obs_dict["head_camera"] = {}
-                    obs_dict["head_camera"]["rgb"] = res["obs"]["sensor_data"][head_camera_name]["rgb"][j]
-                    obs_dict["head_camera"]["intrinsic_cv"] = res["obs"]["sensor_param"][head_camera_name]["intrinsic_cv"][j]
-                    obs_dict["head_camera"]["extrinsic_cv"] = res["obs"]["sensor_param"][head_camera_name]["extrinsic_cv"][j]
-                    obs_dict["head_camera"]["cam2world_gl"] = res["obs"]["sensor_param"][head_camera_name]["cam2world_gl"][j]
-                    
-                    # Wrist camera (mounted on robot end-effector) - only for agents, not global
-                    if wrist_camera_name is not None and wrist_camera_name in res["obs"]["sensor_data"]:
-                        obs_dict["wrist_camera"] = {}
-                        obs_dict["wrist_camera"]["rgb"] = res["obs"]["sensor_data"][wrist_camera_name]["rgb"][j]
-                        obs_dict["wrist_camera"]["intrinsic_cv"] = res["obs"]["sensor_param"][wrist_camera_name]["intrinsic_cv"][j]
-                        obs_dict["wrist_camera"]["extrinsic_cv"] = res["obs"]["sensor_param"][wrist_camera_name]["extrinsic_cv"][j]
-                        obs_dict["wrist_camera"]["cam2world_gl"] = res["obs"]["sensor_param"][wrist_camera_name]["cam2world_gl"][j]
-                    
-                    if agent_id == agent_num:
-                        step_data = dict(
-                            pointcloud=None,
-                            joint_action=None,
-                            endpose=None,
-                            observation=obs_dict,
-                        )
+                # Wrist camera (mounted on robot end-effector) - only for agents, not global
+                if wrist_camera_name is not None and wrist_camera_name in res["obs"]["sensor_data"]:
+                    obs_dict["wrist_camera"] = {}
+                    obs_dict["wrist_camera"]["rgb"] = res["obs"]["sensor_data"][wrist_camera_name]["rgb"][j]
+                    obs_dict["wrist_camera"]["intrinsic_cv"] = res["obs"]["sensor_param"][wrist_camera_name]["intrinsic_cv"][j]
+                    obs_dict["wrist_camera"]["extrinsic_cv"] = res["obs"]["sensor_param"][wrist_camera_name]["extrinsic_cv"][j]
+                    obs_dict["wrist_camera"]["cam2world_gl"] = res["obs"]["sensor_param"][wrist_camera_name]["cam2world_gl"][j]
+                
+                if agent_id == agent_num:
+                    step_data = dict(
+                        pointcloud=None,
+                        joint_action=None,
+                        endpose=None,
+                        observation=obs_dict,
+                    )
+                else:
+                    # Get action for this agent - handle both dict and array structures
+                    if isinstance(res["action"], dict):
+                        agent_action = res["action"][f'panda-{agent_id}'][j]
                     else:
-                        # Get action for this agent - handle both dict and array structures
-                        if isinstance(res["action"], dict):
-                            agent_action = res["action"][f'panda-{agent_id}'][j]
-                        else:
-                            # For single-agent, use the action directly
-                            agent_action = res["action"][j]
-                        
-                        step_data = dict(
-                            pointcloud=None,
-                            joint_action=agent_action,
-                            endpose=agent_action,
-                            observation=obs_dict,
-                        )
-                    with open(f"{episode_dir}/{j}.pkl", "wb") as f:
-                        pickle.dump(step_data, f)
+                        # For single-agent, use the action directly
+                        agent_action = res["action"][j]
+                    
+                    step_data = dict(
+                        pointcloud=None,
+                        joint_action=agent_action,
+                        endpose=agent_action,
+                        observation=obs_dict,
+                    )
+                with open(f"{episode_dir}/{j}.pkl", "wb") as f:
+                    pickle.dump(step_data, f)
             
             # Periodically clean memory
             if (i + 1) % batch_size == 0:
                 gc.collect()
     
-        print("\n✓ All episodes processed successfully!")
+    print("\n✓ All episodes processed successfully!")
     
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()

@@ -20,6 +20,9 @@ SCENE_TYPES=("table" "robocasa")
 LOG_FILE="data_preparation_$(date +%Y%m%d_%H%M%S).log"
 SPECIFIC_TASK=""
 SPECIFIC_SCENE=""
+# Batch processing configuration for h5 to pkl conversion
+H5_BATCH_SIZE=8  # Number of episodes to process in each batch (to avoid OOM)
+H5_NUM_WORKERS=16  # Number of parallel workers for h5 to pkl conversion
 
 # Colors for output
 RED='\033[0;31m'
@@ -59,13 +62,23 @@ parse_args() {
                 NUM_EPISODES="$2"
                 shift 2
                 ;;
+            --batch-size)
+                H5_BATCH_SIZE="$2"
+                shift 2
+                ;;
+            --workers)
+                H5_NUM_WORKERS="$2"
+                shift 2
+                ;;
             --help|-h)
                 echo "Usage: $0 [OPTIONS]"
                 echo ""
                 echo "Options:"
                 echo "  --task, -t TASK    Prepare data for specific task only"
                 echo "  --scene, -s SCENE  Use specific scene type (table or robocasa)"
-                echo "  --num, -n NUM      Number of episodes to generate (default: 8)"
+                echo "  --num, -n NUM      Number of episodes to generate (default: 160)"
+                echo "  --batch-size NUM   Batch size for h5 to pkl conversion (default: 5)"
+                echo "  --workers NUM      Number of parallel workers for h5 to pkl (default: 16)"
                 echo "  --help, -h         Show this help message"
                 echo ""
                 echo "Available tasks:"
@@ -335,8 +348,8 @@ prepare_task_data() {
     if has_pkl_data "$task_name" "$agent_count"; then
         log "  Step 3/5: ${GREEN}[SKIP]${NC} PKL data already exists for all $agent_count agents"
     else
-        log "  Step 3/5: Converting h5 to pkl..."
-        if python script/parse_h5_to_pkl_multi.py --task_name "$task_name" --load_num $NUM_EPISODES --agent_num $agent_count; then
+        log "  Step 3/5: Converting h5 to pkl with batch_size=$H5_BATCH_SIZE and $H5_NUM_WORKERS workers..."
+        if python script/parse_h5_to_pkl_multi.py --task_name "$task_name" --load_num $NUM_EPISODES --agent_num $agent_count --batch_size $H5_BATCH_SIZE --num_workers $H5_NUM_WORKERS; then
             log "  ✓ H5 to PKL conversion completed for $agent_count agents + global"
         else
             log "${RED}  ✗ H5 to PKL conversion failed for $task_name${NC}"
