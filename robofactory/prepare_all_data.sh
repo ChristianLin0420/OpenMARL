@@ -10,10 +10,12 @@
 #   ./prepare_all_data.sh --num 50                  # Generate 50 episodes for all tasks
 #   ./prepare_all_data.sh --task LiftBarrier --num 100      # 100 episodes for LiftBarrier
 
+export PYTHONPATH="${PYTHONPATH}:$(pwd)/.."
+
 set -e  # Exit on any error
 
 # Default Configuration
-NUM_EPISODES=16
+NUM_EPISODES=160
 SCENE_TYPES=("table" "robocasa")
 LOG_FILE="data_preparation_$(date +%Y%m%d_%H%M%S).log"
 SPECIFIC_TASK=""
@@ -183,7 +185,89 @@ get_task_name() {
     echo "${task_name}-rf"
 }
 
-# Prepare data for a single task
+#==============================================================================
+# Step-level existence checks for incremental processing
+#==============================================================================
+
+# Check if h5 data exists for a task
+has_h5_data() {
+    local task_name="$1"
+    local h5_file="data/h5_data/${task_name}.h5"
+    local json_file="data/h5_data/${task_name}.json"
+    
+    if [ -f "$h5_file" ] && [ -f "$json_file" ]; then
+        return 0
+    fi
+    return 1
+}
+
+# Check if pkl data exists for a task (all agents)
+has_pkl_data() {
+    local task_name="$1"
+    local agent_count="$2"
+    
+    for ((i=0; i<agent_count; i++)); do
+        local pkl_dir="data/pkl_data/${task_name}_Agent${i}"
+        if [ ! -d "$pkl_dir" ]; then
+            return 1
+        fi
+    done
+    return 0
+}
+
+# Check if zarr data exists for a specific agent
+has_zarr_data_agent() {
+    local task_name="$1"
+    local agent_id="$2"
+    local zarr_path="data/zarr_data/${task_name}_Agent${agent_id}_${NUM_EPISODES}.zarr"
+    
+    if [ -d "$zarr_path" ]; then
+        return 0
+    fi
+    return 1
+}
+
+# Check if zarr data exists for all agents
+has_zarr_data() {
+    local task_name="$1"
+    local agent_count="$2"
+    
+    for ((i=0; i<agent_count; i++)); do
+        if ! has_zarr_data_agent "$task_name" "$i"; then
+            return 1
+        fi
+    done
+    return 0
+}
+
+# Check if RLDS data exists for a specific agent
+has_rlds_data_agent() {
+    local task_name="$1"
+    local agent_id="$2"
+    local rlds_path="data/rlds_data/${task_name}_Agent${agent_id}"
+    
+    if [ -d "$rlds_path" ]; then
+        return 0
+    fi
+    return 1
+}
+
+# Check if RLDS data exists for all agents
+has_rlds_data() {
+    local task_name="$1"
+    local agent_count="$2"
+    
+    for ((i=0; i<agent_count; i++)); do
+        if ! has_rlds_data_agent "$task_name" "$i"; then
+            return 1
+        fi
+    done
+    return 0
+}
+
+#==============================================================================
+# Prepare data for a single task (with step-level skipping)
+#==============================================================================
 prepare_task_data() {
     local config_file="$1"
     local scene_type="$2"
@@ -191,45 +275,7 @@ prepare_task_data() {
     
     log "${BLUE}Processing task: $task_name${NC}"
     
-    # Check if already prepared
-    if is_task_prepared "$task_name" "$scene_type"; then
-        log "${GREEN}✓ Task $task_name is already prepared, skipping...${NC}"
-        return 0
-    fi
-    
-    log "${YELLOW}→ Generating data for $task_name...${NC}"
-    
-    # Step 1: Generate raw data
-    log "  Step 1/5: Generating raw data..."
-    if python script/generate_data.py --config "$config_file" --num $NUM_EPISODES --save-video; then
-        log "  ✓ Raw data generation completed"
-    else
-        log "${RED}  ✗ Raw data generation failed for $task_name${NC}"
-        return 1
-    fi
-    
-    # Step 2: Move h5 files to data directory
-    log "  Step 2/5: Moving h5 files..."
-    local demo_dir="demos/${task_name}/motionplanning"
-    if [ -d "$demo_dir" ]; then
-        # Find the largest h5 file (main data file)
-        local main_h5=$(find "$demo_dir" -name "*.h5" -type f -exec ls -la {} \; | sort -k5 -nr | head -1 | awk '{print $NF}')
-        local main_json="${main_h5%.h5}.json"
-        
-        if [ -f "$main_h5" ] && [ -f "$main_json" ]; then
-            cp "$main_h5" "data/h5_data/${task_name}.h5"
-            cp "$main_json" "data/h5_data/${task_name}.json"
-            log "  ✓ H5 files moved to data/h5_data/"
-        else
-            log "${RED}  ✗ Could not find main h5/json files in $demo_dir${NC}"
-            return 1
-        fi
-    else
-        log "${RED}  ✗ Demo directory $demo_dir not found${NC}"
-        return 1
-    fi
-    
-    # Get the number of agents for this task
+    # Get the number of agents for this task (needed for all checks)
     local agent_count=$(get_agent_count "$task_name")
     
     if [ "$agent_count" -eq 0 ]; then
@@ -239,42 +285,116 @@ prepare_task_data() {
     
     log "  Found $agent_count agents for this task"
     
-    # Step 3: Convert h5 to pkl (includes wrist cameras and global camera)
-    log "  Step 3/5: Converting h5 to pkl..."
-    if python script/parse_h5_to_pkl_multi.py --task_name "$task_name" --load_num $NUM_EPISODES --agent_num $agent_count; then
-        log "  ✓ H5 to PKL conversion completed for $agent_count agents + global"
-    else
-        log "${RED}  ✗ H5 to PKL conversion failed for $task_name${NC}"
-        return 1
+    # Check if fully prepared (all RLDS data exists)
+    if has_rlds_data "$task_name" "$agent_count"; then
+        log "${GREEN}✓ Task $task_name is fully prepared (all RLDS data exists), skipping...${NC}"
+        return 0
     fi
     
-    # Step 4: Convert pkl to zarr (includes wrist cameras)
-    log "  Step 4/5: Converting pkl to zarr..."
-    # Convert agent data (with wrist cameras)
-    for ((agent_id=0; agent_id<agent_count; agent_id++)); do
-        if python script/parse_pkl_to_zarr_dp.py --task_name "$task_name" --load_num $NUM_EPISODES --agent_id $agent_id; then
-            log "  ✓ PKL to ZARR conversion completed for Agent $agent_id (head + wrist cameras)"
+    log "${YELLOW}→ Processing data for $task_name...${NC}"
+    
+    #--------------------------------------------------------------------------
+    # Step 1 & 2: Generate raw data and move h5 files
+    #--------------------------------------------------------------------------
+    if has_h5_data "$task_name"; then
+        log "  Step 1/5: ${GREEN}[SKIP]${NC} H5 data already exists"
+        log "  Step 2/5: ${GREEN}[SKIP]${NC} H5 files already in data/h5_data/"
+    else
+        log "  Step 1/5: Generating raw data..."
+        if python script/generate_data.py --config "$config_file" --num $NUM_EPISODES --save-video; then
+            log "  ✓ Raw data generation completed"
         else
-            log "${RED}  ✗ PKL to ZARR conversion failed for Agent $agent_id${NC}"
+            log "${RED}  ✗ Raw data generation failed for $task_name${NC}"
             return 1
+        fi
+        
+        log "  Step 2/5: Moving h5 files..."
+        local demo_dir="demos/${task_name}/motionplanning"
+        if [ -d "$demo_dir" ]; then
+            # Find the largest h5 file (main data file)
+            local main_h5=$(find "$demo_dir" -name "*.h5" -type f -exec ls -la {} \; | sort -k5 -nr | head -1 | awk '{print $NF}')
+            local main_json="${main_h5%.h5}.json"
+            
+            if [ -f "$main_h5" ] && [ -f "$main_json" ]; then
+                cp "$main_h5" "data/h5_data/${task_name}.h5"
+                cp "$main_json" "data/h5_data/${task_name}.json"
+                log "  ✓ H5 files moved to data/h5_data/"
+            else
+                log "${RED}  ✗ Could not find main h5/json files in $demo_dir${NC}"
+                return 1
+            fi
+        else
+            log "${RED}  ✗ Demo directory $demo_dir not found${NC}"
+            return 1
+        fi
+    fi
+    
+    #--------------------------------------------------------------------------
+    # Step 3: Convert h5 to pkl
+    #--------------------------------------------------------------------------
+    if has_pkl_data "$task_name" "$agent_count"; then
+        log "  Step 3/5: ${GREEN}[SKIP]${NC} PKL data already exists for all $agent_count agents"
+    else
+        log "  Step 3/5: Converting h5 to pkl..."
+        if python script/parse_h5_to_pkl_multi.py --task_name "$task_name" --load_num $NUM_EPISODES --agent_num $agent_count; then
+            log "  ✓ H5 to PKL conversion completed for $agent_count agents + global"
+        else
+            log "${RED}  ✗ H5 to PKL conversion failed for $task_name${NC}"
+            return 1
+        fi
+    fi
+    
+    #--------------------------------------------------------------------------
+    # Step 4: Convert pkl to zarr (per-agent check)
+    #--------------------------------------------------------------------------
+    log "  Step 4/5: Converting pkl to zarr..."
+    local zarr_skipped=0
+    local zarr_converted=0
+    
+    for ((agent_id=0; agent_id<agent_count; agent_id++)); do
+        if has_zarr_data_agent "$task_name" "$agent_id"; then
+            log "    Agent $agent_id: ${GREEN}[SKIP]${NC} ZARR data already exists"
+            zarr_skipped=$((zarr_skipped + 1))
+        else
+            if python script/parse_pkl_to_zarr_dp.py --task_name "$task_name" --load_num $NUM_EPISODES --agent_id $agent_id; then
+                log "    Agent $agent_id: ✓ PKL to ZARR conversion completed"
+                zarr_converted=$((zarr_converted + 1))
+            else
+                log "${RED}    Agent $agent_id: ✗ PKL to ZARR conversion failed${NC}"
+                return 1
+            fi
         fi
     done
     
-    # Convert global camera data
-    if python script/parse_pkl_to_zarr_dp.py --task_name "$task_name" --load_num $NUM_EPISODES --agent_id -1; then
-        log "  ✓ PKL to ZARR conversion completed for Global camera"
+    # Global camera zarr
+    local global_zarr="data/zarr_data/${task_name}_global_${NUM_EPISODES}.zarr"
+    if [ -d "$global_zarr" ]; then
+        log "    Global: ${GREEN}[SKIP]${NC} ZARR data already exists"
     else
-        log "${YELLOW}  ⚠ Global camera conversion skipped${NC}"
+        if python script/parse_pkl_to_zarr_dp.py --task_name "$task_name" --load_num $NUM_EPISODES --agent_id -1 2>/dev/null; then
+            log "    Global: ✓ PKL to ZARR conversion completed"
+        else
+            log "    Global: ${YELLOW}[SKIP]${NC} Global camera conversion skipped"
+        fi
     fi
     
-    # Step 5: Convert zarr to RLDS format (for OpenVLA training)
-    log "  Step 5/5: Converting zarr to RLDS..."
+    log "  ✓ Step 4 complete (converted: $zarr_converted, skipped: $zarr_skipped)"
     
-    # Convert agent data to RLDS
+    #--------------------------------------------------------------------------
+    # Step 5: Convert zarr to RLDS (per-agent check)
+    #--------------------------------------------------------------------------
+    log "  Step 5/5: Converting zarr to RLDS..."
+    local rlds_skipped=0
+    local rlds_converted=0
+    
     for ((agent_id=0; agent_id<agent_count; agent_id++)); do
-        local zarr_path="data/zarr_data/${task_name}_Agent${agent_id}_${NUM_EPISODES}.zarr"
-        if [ -d "$zarr_path" ]; then
-            if python -c "
+        if has_rlds_data_agent "$task_name" "$agent_id"; then
+            log "    Agent $agent_id: ${GREEN}[SKIP]${NC} RLDS data already exists"
+            rlds_skipped=$((rlds_skipped + 1))
+        else
+            local zarr_path="data/zarr_data/${task_name}_Agent${agent_id}_${NUM_EPISODES}.zarr"
+            if [ -d "$zarr_path" ]; then
+                if python -c "
 from robofactory.policy.OpenVLA.openvla_policy.utils.data_conversion import convert_zarr_to_rlds, create_dataset_statistics
 import os
 
@@ -311,16 +431,24 @@ stats_path = os.path.join(output_path, 'statistics.json')
 create_dataset_statistics(zarr_path, stats_path)
 print(f'RLDS conversion successful: {output_path}')
 " 2>/dev/null; then
-                log "  ✓ ZARR to RLDS conversion completed for Agent $agent_id"
+                    log "    Agent $agent_id: ✓ ZARR to RLDS conversion completed"
+                    rlds_converted=$((rlds_converted + 1))
+                else
+                    log "    Agent $agent_id: ${YELLOW}[WARN]${NC} ZARR to RLDS conversion failed"
+                fi
             else
-                log "${YELLOW}  ⚠ ZARR to RLDS conversion skipped for Agent $agent_id${NC}"
+                log "    Agent $agent_id: ${YELLOW}[WARN]${NC} ZARR data not found, skipping RLDS"
             fi
         fi
     done
     
     # Convert global camera data to RLDS
+    local global_rlds_path="data/rlds_data/${task_name}_global"
     local global_zarr_path="data/zarr_data/${task_name}_global_${NUM_EPISODES}.zarr"
-    if [ -d "$global_zarr_path" ]; then
+    
+    if [ -d "$global_rlds_path" ]; then
+        log "    Global: ${GREEN}[SKIP]${NC} RLDS data already exists"
+    elif [ -d "$global_zarr_path" ]; then
         if python -c "
 from robofactory.policy.OpenVLA.openvla_policy.utils.data_conversion import convert_zarr_to_rlds_global, create_dataset_statistics
 import os
@@ -356,11 +484,15 @@ stats_path = os.path.join(output_path, 'statistics.json')
 create_dataset_statistics(zarr_path, stats_path)
 print(f'RLDS conversion successful: {output_path}')
 " 2>/dev/null; then
-            log "  ✓ ZARR to RLDS conversion completed for Global camera"
+            log "    Global: ✓ ZARR to RLDS conversion completed"
         else
-            log "${YELLOW}  ⚠ ZARR to RLDS conversion skipped for Global camera${NC}"
+            log "    Global: ${YELLOW}[SKIP]${NC} Global RLDS conversion skipped"
         fi
+    else
+        log "    Global: ${YELLOW}[SKIP]${NC} No global ZARR data found"
     fi
+    
+    log "  ✓ Step 5 complete (converted: $rlds_converted, skipped: $rlds_skipped)"
     
     log "${GREEN}✓ Task $task_name data preparation completed successfully!${NC}"
     return 0

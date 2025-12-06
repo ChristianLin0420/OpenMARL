@@ -146,16 +146,6 @@ cameras:
       fov: 1.5707963268
       near: 0.01
       far: 10
-    - 
-      uid: head_camera
-      pose:
-        type: pose
-        params: [[1.89682, -3.40356, 1.58765], [0.983518, 0.00296655, 0.180058, -0.0162029]]
-      width: 3840
-      height: 2160
-      fov: 1.5707963268
-      near: 0.01
-      far: 10
   human_render:
     - 
       uid: render_camera

@@ -66,12 +66,22 @@ agents:
 cameras:
   sensor:
     - 
-      uid: head_camera
+      uid: head_camera_agent0
       pose:
         type: look_at
         params: [[2.8, -2.85, 1.32], [2.45, -3.35, 1.02]]
-      width: 512
-      height: 512
+      width: 320
+      height: 240
+      fov: 1.5707963268
+      near: 0.1
+      far: 10
+    - 
+      uid: head_camera_global
+      pose:
+        type: look_at
+        params: [[3.0, -2.65, 1.52], [2.55, -3.35, 1.02]]
+      width: 320
+      height: 240
       fov: 1.5707963268
       near: 0.1
       far: 10
