@@ -2,12 +2,13 @@ defaults:
   - _self_
   - task: default_task
 
-name: robot_${task.name}
+name: dp_${task.name}
 _target_: diffusion_policy.workspace.robotworkspace.RobotWorkspace
 
 task_name: ${task.name}
 shape_meta: ${task.shape_meta}
-exp_name: "default"
+exp_name: "dp"  # Changed from "diffusion_policy" - shorter like OpenVLA's "openvla"
+agent_id: 0  # Override via command line: agent_id=0, agent_id=1, etc.
 
 horizon: 8
 n_obs_steps: 3
@@ -74,17 +75,17 @@ ema:
 
 dataloader:
   batch_size: 64
-  num_workers: 0
+  num_workers: 8
   shuffle: True
   pin_memory: True
-  persistent_workers: False
+  persistent_workers: True
 
 val_dataloader:
   batch_size: 64
-  num_workers: 0
+  num_workers: 4
   shuffle: False
   pin_memory: True
-  persistent_workers: False
+  persistent_workers: True
 
 optimizer:
   _target_: torch.optim.AdamW
@@ -103,6 +104,7 @@ training:
   lr_warmup_steps: 500
   num_epochs: 300
   gradient_accumulate_every: 1
+  max_grad_norm: 1.0
   # EMA destroys performance when used with BatchNorm
   # replace BatchNorm with GroupNorm.
   use_ema: True
@@ -118,15 +120,30 @@ training:
   max_val_steps: null
   # misc
   tqdm_interval_sec: 1.0
+  
+  # Simulation evaluation with parallel CPU envs
+  eval_in_sim: True
+  eval_sim_every_n_epochs: 50     # Run sim eval every 50 epochs
+  eval_sim_episodes: 8            # Number of evaluation episodes
+  eval_sim_num_envs: 8            # Parallel envs on CPU (use 8 of 16 CPUs)
+  eval_sim_max_steps: 200         # Max steps per episode
 
 logging:
-  project: diffusion_policy_debug
+  project: "openmarl"
   resume: True
   mode: online
-  name: ${now:%Y.%m.%d-%H.%M.%S}_${name}_${task_name}
-  tags: ["${name}", "${task_name}", "${exp_name}"]
+  name: "${task_name}_${exp_name}_Agent${agent_id}"  # Will produce: "LiftBarrier-rf_dp_Agent0"
+  tags: ["${exp_name}", "${task_name}", "Agent${agent_id}"]  # Simplified, removed redundant ${name}
   id: null
   group: null
+  
+  # Step-level logging (aligned with OpenVLA)
+  log_every_n_steps: 50            # Log to wandb every N steps
+  log_gradients: True              # Log gradient norms
+  log_learning_rate: True          # Log learning rate
+  log_images: False                 # Log sample observations
+  log_action_predictions: False     # Log predicted vs GT actions
+  log_eval_video: False             # Log evaluation rollout videos
 
 checkpoint:
   topk:

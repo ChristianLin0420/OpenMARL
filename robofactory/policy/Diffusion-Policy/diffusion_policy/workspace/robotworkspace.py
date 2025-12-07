@@ -1,3 +1,11 @@
+"""
+Diffusion Policy training workspace with DDP and enhanced logging support.
+
+This module implements the training loop for Diffusion Policy models using PyTorch DDP
+for distributed training across multiple GPUs, with comprehensive wandb logging
+aligned with OpenVLA patterns.
+"""
+
 if __name__ == "__main__":
     import sys
     import os
@@ -20,6 +28,7 @@ import copy
 import random
 import tqdm
 import numpy as np
+from typing import Dict, Any, Optional
 from diffusion_policy.workspace.base_workspace import BaseWorkspace
 from diffusion_policy.policy.diffusion_unet_image_policy import DiffusionUnetImagePolicy
 from diffusion_policy.dataset.base_dataset import BaseImageDataset
@@ -181,10 +190,23 @@ class BatchSampler:
 
 
 # ============================================================================
-# RobotWorkspace with DDP Support
+# RobotWorkspace with DDP Support and Enhanced Logging
 # ============================================================================
 
 class RobotWorkspace(BaseWorkspace):
+    """
+    Training workspace for Diffusion Policy models.
+    
+    Features:
+    - Multi-GPU training with DDP
+    - Comprehensive wandb logging (aligned with OpenVLA)
+    - Gradient norm tracking
+    - Loss statistics
+    - Visual logging (observations, action predictions)
+    - Evaluation video logging
+    - Best model checkpointing
+    """
+    
     include_keys = ['global_step', 'epoch']
 
     def __init__(self, cfg: OmegaConf, output_dir=None):
@@ -212,9 +234,617 @@ class RobotWorkspace(BaseWorkspace):
         self.optimizer = hydra.utils.instantiate(
             cfg.optimizer, params=self.model.parameters())
 
-        # Configure training state
+        # Training state
         self.global_step = 0
         self.epoch = 0
+        
+        # Best loss tracking (aligned with OpenVLA)
+        self.best_loss = float('inf')
+        
+        # Step-level loss tracking for statistics
+        self.step_losses = []
+        
+        # Evaluation environment (lazy init)
+        self.eval_env = None
+        self.eval_env_id = None
+
+    def _compute_grad_norm(self) -> float:
+        """Compute the total gradient norm (aligned with OpenVLA)."""
+        total_norm = 0.0
+        for p in self.model.parameters():
+            if p.grad is not None:
+                param_norm = p.grad.data.norm(2)
+                total_norm += param_norm.item() ** 2
+        return total_norm ** 0.5
+
+    def _log_sample_images(self, batch, step):
+        """Log sample observation images to wandb."""
+        try:
+            obs = batch['obs']
+            if 'head_cam' in obs:
+                images = obs['head_cam']  # (B, T, C, H, W)
+                # Take first sample, last timestep
+                img = images[0, -1].cpu().numpy()
+                if img.shape[0] == 3:  # CHW -> HWC
+                    img = np.transpose(img, (1, 2, 0))
+                # Denormalize if needed (ImageNet normalization)
+                mean = np.array([0.485, 0.456, 0.406])
+                std = np.array([0.229, 0.224, 0.225])
+                img = img * std + mean
+                img = np.clip(img * 255, 0, 255).astype(np.uint8)
+                wandb.log({
+                    "samples/input_observation": wandb.Image(img, caption=f"Step {step}")
+                }, step=step)
+        except Exception as e:
+            pass  # Silent fail for image logging
+
+    def _log_action_predictions(self, gt_action, pred_action, step):
+        """Log action prediction comparison as a plot."""
+        try:
+            import matplotlib
+            matplotlib.use('Agg')
+            import matplotlib.pyplot as plt
+            from io import BytesIO
+            from PIL import Image as PILImage
+            
+            gt = gt_action[0].cpu().numpy()  # First sample
+            pred = pred_action[0].cpu().numpy()
+            
+            fig, axes = plt.subplots(2, 1, figsize=(12, 6))
+            
+            # Plot each action dimension
+            time_steps = np.arange(gt.shape[0])
+            
+            # Ground truth
+            axes[0].set_title('Ground Truth Actions')
+            for i in range(min(gt.shape[1], 8)):
+                axes[0].plot(time_steps, gt[:, i], label=f'dim{i}', alpha=0.7)
+            axes[0].legend(loc='upper right', fontsize=8)
+            axes[0].set_ylabel('Action Value')
+            axes[0].grid(True, alpha=0.3)
+            
+            # Predicted
+            axes[1].set_title('Predicted Actions')
+            for i in range(min(pred.shape[1], 8)):
+                axes[1].plot(time_steps, pred[:, i], label=f'dim{i}', alpha=0.7)
+            axes[1].legend(loc='upper right', fontsize=8)
+            axes[1].set_xlabel('Time Step')
+            axes[1].set_ylabel('Action Value')
+            axes[1].grid(True, alpha=0.3)
+            
+            plt.tight_layout()
+            
+            # Convert to wandb image
+            buf = BytesIO()
+            plt.savefig(buf, format='png', dpi=100)
+            buf.seek(0)
+            img = PILImage.open(buf)
+            
+            wandb.log({
+                "samples/action_prediction": wandb.Image(img, caption=f"Step {step}")
+            }, step=step)
+            
+            plt.close(fig)
+        except Exception as e:
+            pass  # Silent fail
+
+    def _init_eval_env(self):
+        """Lazy initialization of evaluation environment with GPU backend for parallel envs."""
+        if self.eval_env is not None:
+            return True
+        
+        cfg = self.cfg
+        
+        # Setup headless rendering
+        os.environ["PYOPENGL_PLATFORM"] = "egl"
+        os.environ["MUJOCO_GL"] = "egl"
+        os.environ["DISPLAY"] = ""
+        
+        try:
+            import gymnasium as gym
+            import robofactory.tasks
+        except (ImportError, FileNotFoundError, OSError) as e:
+            print(f"Warning: Could not import simulation dependencies: {e}")
+            return False
+        
+        # Determine environment ID from task
+        env_id = cfg.task.name if hasattr(cfg.task, 'name') else None
+        if env_id and not env_id.endswith('-rf'):
+            env_id += '-rf'
+        
+        if env_id is None:
+            print("Warning: Could not determine environment ID")
+            return False
+        
+        # Get parallel env count from config
+        num_parallel = getattr(cfg.training, 'eval_sim_num_envs', 4)
+        
+        # Get expected observation shapes from config
+        self.eval_n_obs_steps = getattr(cfg, 'n_obs_steps', 3)
+        self.eval_img_height = 240
+        self.eval_img_width = 320
+        self.eval_state_dim = 8
+        
+        # Try GPU backend first (required for parallel envs in ManiSkill)
+        try:
+            env_kwargs = dict(
+                obs_mode='rgbd',  # Get RGB images and depth (includes camera observations)
+                control_mode='pd_joint_pos',
+                render_mode='rgb_array',
+                num_envs=num_parallel,
+                sim_backend='gpu',  # GPU backend for parallel environments
+            )
+            
+            self.eval_env = gym.make(env_id, **env_kwargs)
+            self.eval_env_id = env_id
+            self.eval_num_parallel = num_parallel
+            
+            # Initialize observation history buffers for each parallel env
+            self.obs_history = {
+                'images': [[] for _ in range(num_parallel)],
+                'states': [[] for _ in range(num_parallel)],
+            }
+            
+            print(f"Initialized eval env: {env_id} with {num_parallel} parallel envs (GPU)")
+            print(f"  Observation format: {self.eval_n_obs_steps} timesteps, {self.eval_img_height}x{self.eval_img_width} images")
+            return True
+            
+        except Exception as e:
+            print(f"GPU parallel env failed ({e}), falling back to single CPU env...")
+            
+            # Fallback to single CPU env
+            try:
+                env_kwargs = dict(
+                    obs_mode='rgbd',  # Get RGB images and depth
+                    control_mode='pd_joint_pos',
+                    render_mode='rgb_array',
+                    num_envs=1,
+                    sim_backend='cpu',
+                )
+                
+                self.eval_env = gym.make(env_id, **env_kwargs)
+                self.eval_env_id = env_id
+                self.eval_num_parallel = 1
+                
+                # Initialize observation history buffers
+                self.obs_history = {
+                    'images': [[]],
+                    'states': [[]],
+                }
+                
+                print(f"Initialized eval env: {env_id} with 1 env (CPU fallback)")
+                print(f"  Observation format: {self.eval_n_obs_steps} timesteps, {self.eval_img_height}x{self.eval_img_width} images")
+                return True
+                
+            except Exception as e2:
+                print(f"Warning: Could not create eval environment: {e2}")
+                import traceback
+                traceback.print_exc()
+                return False
+
+    @torch.no_grad()
+    def _evaluate_in_simulation(self, policy) -> Dict[str, Any]:
+        """
+        Run model evaluation in simulation and log videos to wandb.
+        
+        Properly handles observation format matching:
+        - Maintains observation history buffer (n_obs_steps=3)
+        - Resizes images to training dimensions (240x320)
+        - Normalizes images to [0, 1]
+        - Extracts proper agent state
+        
+        Returns:
+            Dictionary with evaluation metrics
+        """
+        if not is_main_process():
+            return {}
+        
+        cfg = self.cfg
+        
+        # Check if eval is enabled
+        if not getattr(cfg.training, 'eval_in_sim', False):
+            return {}
+        
+        # Lazy initialize environment
+        if not self._init_eval_env():
+            print("Skipping simulation evaluation - environment not available")
+            return {}
+        
+        env = self.eval_env
+        num_parallel = self.eval_num_parallel
+        n_obs_steps = self.eval_n_obs_steps
+        
+        # Get evaluation settings
+        num_episodes = getattr(cfg.training, 'eval_sim_episodes', 4)
+        max_steps = getattr(cfg.training, 'eval_sim_max_steps', 200)
+        log_video = getattr(cfg.logging, 'log_eval_video', True)
+        
+        print(f"\nRunning simulation evaluation: {num_episodes} episodes with {num_parallel} parallel envs")
+        
+        try:
+            policy.eval()
+            device = next(policy.parameters()).device
+            
+            all_successes = []
+            all_rewards = []
+            all_frames = []
+            
+            num_batches = (num_episodes + num_parallel - 1) // num_parallel
+            
+            for batch_idx in range(num_batches):
+                obs, info = env.reset()
+                episode_rewards = np.zeros(num_parallel)
+                batch_frames = []
+                
+                # Reset observation history for new episodes
+                self.obs_history = {
+                    'images': [[] for _ in range(num_parallel)],
+                    'states': [[] for _ in range(num_parallel)],
+                }
+                
+                for step in range(max_steps):
+                    # Update observation history and get formatted observations
+                    obs_dict = self._update_obs_history_and_prepare(obs, num_parallel, device)
+                    if obs_dict is None:
+                        print(f"Warning: Failed to prepare observations at step {step}")
+                        break
+                    
+                    # Predict actions for all parallel environments
+                    actions = []
+                    for i in range(num_parallel):
+                        # Extract single env observation
+                        single_obs = {
+                            'head_cam': obs_dict['head_cam'][i:i+1],  # (1, T, C, H, W)
+                            'agent_pos': obs_dict['agent_pos'][i:i+1],  # (1, T, D)
+                        }
+                        result = policy.predict_action(single_obs)
+                        # Get first action from predicted sequence
+                        action = result['action'][0, 0].cpu().numpy()  # (action_dim,)
+                        actions.append(action)
+                    
+                    # Format actions for environment
+                    action_batch = self._format_actions_for_env(actions, env, num_parallel)
+                    
+                    # Step environment
+                    obs, reward, terminated, truncated, info = env.step(action_batch)
+                    
+                    # Accumulate rewards
+                    reward_np = self._to_numpy(reward)
+                    if np.isscalar(reward_np):
+                        episode_rewards[0] += reward_np
+                    else:
+                        episode_rewards += np.array(reward_np).flatten()[:num_parallel]
+                    
+                    # Capture frames for video (last batch only, every 2nd frame)
+                    if log_video and batch_idx == num_batches - 1 and step % 2 == 0:
+                        try:
+                            frame = env.render()
+                            if frame is not None:
+                                if isinstance(frame, np.ndarray) and frame.ndim == 4:
+                                    frame = frame[0]
+                                elif isinstance(frame, torch.Tensor):
+                                    frame = frame[0].cpu().numpy() if frame.ndim == 4 else frame.cpu().numpy()
+                                batch_frames.append(frame)
+                        except:
+                            pass
+                    
+                    # Check if done
+                    terminated_np = self._to_numpy(terminated)
+                    truncated_np = self._to_numpy(truncated)
+                    done = np.logical_or(terminated_np, truncated_np)
+                    if np.isscalar(done):
+                        if done:
+                            break
+                    elif np.all(done):
+                        break
+                
+                # Collect success info
+                if isinstance(info, dict):
+                    success = info.get('success', False)
+                    success_np = self._to_numpy(success) if not isinstance(success, bool) else success
+                    if np.isscalar(success_np):
+                        all_successes.append(success_np)
+                    else:
+                        all_successes.extend(np.array(success_np).flatten()[:num_parallel].tolist())
+                
+                all_rewards.extend(episode_rewards[:num_parallel].tolist())
+                
+                if batch_idx == num_batches - 1:
+                    all_frames = batch_frames
+            
+            # Compute metrics
+            successes = all_successes[:num_episodes]
+            rewards = all_rewards[:num_episodes]
+            
+            success_rate = sum(successes) / len(successes) if successes else 0.0
+            avg_reward = np.mean(rewards) if rewards else 0.0
+            
+            metrics = {
+                'eval/sim_success_rate': float(success_rate),
+                'eval/sim_avg_reward': float(avg_reward),
+                'eval/sim_episodes': num_episodes,
+            }
+            
+            print(f"  Success rate: {success_rate:.2%}, Avg reward: {avg_reward:.4f}")
+            
+            # Log to wandb
+            if cfg.logging.mode == "online":
+                wandb.log(metrics, step=self.global_step)
+                
+                # Log video
+                if log_video and all_frames and len(all_frames) > 0:
+                    try:
+                        video_array = np.stack(all_frames, axis=0)
+                        # Ensure correct format: (T, C, H, W)
+                        if video_array.ndim == 4 and video_array.shape[-1] == 3:
+                            video_array = np.transpose(video_array, (0, 3, 1, 2))
+                        wandb.log({
+                            "eval/sim_video": wandb.Video(video_array, fps=10, format="mp4")
+                        }, step=self.global_step)
+                        print(f"  Logged evaluation video ({len(all_frames)} frames)")
+                    except Exception as e:
+                        print(f"Warning: Could not log video: {e}")
+            
+            policy.train()
+            return metrics
+            
+        except Exception as e:
+            print(f"Warning: Simulation evaluation failed: {e}")
+            import traceback
+            traceback.print_exc()
+            policy.train()
+            return {}
+    
+    def _update_obs_history_and_prepare(self, obs, num_parallel, device):
+        """
+        Update observation history with new observation and prepare formatted obs dict.
+        
+        Maintains a sliding window of n_obs_steps observations for each parallel env.
+        
+        Args:
+            obs: Raw observation from environment
+            num_parallel: Number of parallel environments
+            device: Target device for tensors
+            
+        Returns:
+            Dict with 'head_cam' (B, T, C, H, W) and 'agent_pos' (B, T, D)
+        """
+        try:
+            import cv2
+            
+            n_obs_steps = self.eval_n_obs_steps
+            target_h, target_w = self.eval_img_height, self.eval_img_width
+            
+            # Extract images and states from observation
+            for i in range(num_parallel):
+                # Get image for this env
+                img = self._extract_single_image(obs, i)
+                if img is None:
+                    return None
+                
+                # Resize to training dimensions
+                if img.shape[0] != target_h or img.shape[1] != target_w:
+                    img = cv2.resize(img, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
+                
+                # Normalize to [0, 1] and convert to CHW
+                img = img.astype(np.float32) / 255.0
+                img = np.transpose(img, (2, 0, 1))  # HWC -> CHW
+                
+                # Get state for this env
+                state = self._extract_single_state(obs, i)
+                if state is None:
+                    state = np.zeros(self.eval_state_dim, dtype=np.float32)
+                
+                # Add to history
+                self.obs_history['images'][i].append(img)
+                self.obs_history['states'][i].append(state)
+                
+                # Keep only last n_obs_steps
+                if len(self.obs_history['images'][i]) > n_obs_steps:
+                    self.obs_history['images'][i] = self.obs_history['images'][i][-n_obs_steps:]
+                    self.obs_history['states'][i] = self.obs_history['states'][i][-n_obs_steps:]
+            
+            # Prepare observation dict with proper padding
+            batch_images = []
+            batch_states = []
+            
+            for i in range(num_parallel):
+                imgs = self.obs_history['images'][i]
+                states = self.obs_history['states'][i]
+                
+                # Pad with first observation if not enough history
+                while len(imgs) < n_obs_steps:
+                    imgs = [imgs[0]] + imgs
+                    states = [states[0]] + states
+                
+                # Stack into arrays: (T, C, H, W) and (T, D)
+                img_stack = np.stack(imgs, axis=0)
+                state_stack = np.stack(states, axis=0)
+                
+                batch_images.append(img_stack)
+                batch_states.append(state_stack)
+            
+            # Convert to tensors: (B, T, C, H, W) and (B, T, D)
+            head_cam = torch.from_numpy(np.stack(batch_images, axis=0)).float().to(device)
+            agent_pos = torch.from_numpy(np.stack(batch_states, axis=0)).float().to(device)
+            
+            return {
+                'head_cam': head_cam,
+                'agent_pos': agent_pos,
+            }
+            
+        except Exception as e:
+            print(f"Warning: Failed to prepare observations: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+    
+    def _extract_single_image(self, obs, env_idx):
+        """Extract image for a single environment from batched observation."""
+        try:
+            image = None
+            
+            if isinstance(obs, dict):
+                # Try different observation keys for ManiSkill
+                if 'sensor_data' in obs:
+                    sensor_data = obs['sensor_data']
+                    # Find first camera with rgb - try known camera names first
+                    for cam_name in ['head_camera_agent0', 'head_camera', 'base_camera', 'hand_camera']:
+                        if cam_name in sensor_data:
+                            cam_data = sensor_data[cam_name]
+                            if isinstance(cam_data, dict) and 'rgb' in cam_data:
+                                image = cam_data['rgb']
+                                break
+                    
+                    # Fallback: find any camera with rgb
+                    if image is None:
+                        for cam_key in sensor_data.keys():
+                            cam_data = sensor_data[cam_key]
+                            if isinstance(cam_data, dict) and 'rgb' in cam_data:
+                                image = cam_data['rgb']
+                                break
+                            elif isinstance(cam_data, (np.ndarray, torch.Tensor)):
+                                if hasattr(cam_data, 'shape') and len(cam_data.shape) >= 3:
+                                    image = cam_data
+                                    break
+                
+                # Try head_camera directly
+                if image is None and 'head_camera' in obs:
+                    cam_data = obs['head_camera']
+                    if isinstance(cam_data, dict) and 'rgb' in cam_data:
+                        image = cam_data['rgb']
+                    else:
+                        image = cam_data
+                
+                # Direct rgb/image keys
+                if image is None and 'rgb' in obs:
+                    image = obs['rgb']
+                if image is None and 'image' in obs:
+                    image = obs['image']
+            
+            if image is None:
+                return None
+            
+            # Handle tensor
+            if isinstance(image, torch.Tensor):
+                image = image.cpu().numpy()
+            
+            # Extract single env from batch
+            if image.ndim == 4:  # (B, H, W, C) or (B, C, H, W)
+                image = image[env_idx]
+            
+            # Ensure HWC format
+            if image.ndim == 3:
+                if image.shape[0] in [3, 4]:  # CHW
+                    image = np.transpose(image, (1, 2, 0))
+                if image.shape[-1] == 4:  # RGBA -> RGB
+                    image = image[..., :3]
+            
+            # Ensure uint8 for resize
+            if image.dtype != np.uint8:
+                if image.max() <= 1.0:
+                    image = (image * 255).astype(np.uint8)
+                else:
+                    image = image.astype(np.uint8)
+            
+            return image
+            
+        except Exception as e:
+            return None
+    
+    def _extract_single_state(self, obs, env_idx):
+        """Extract agent state for a single environment from batched observation."""
+        try:
+            state = None
+            
+            if isinstance(obs, dict):
+                # Try to find agent state/proprio
+                if 'agent' in obs:
+                    agent_obs = obs['agent']
+                    if isinstance(agent_obs, dict):
+                        # Prefer qpos for joint positions
+                        if 'qpos' in agent_obs:
+                            state = agent_obs['qpos']
+                        elif 'joint_pos' in agent_obs:
+                            state = agent_obs['joint_pos']
+                        elif len(agent_obs) > 0:
+                            # Take first available state
+                            first_key = list(agent_obs.keys())[0]
+                            state = agent_obs[first_key]
+                    else:
+                        state = agent_obs
+                elif 'extra' in obs and 'agent' in obs['extra']:
+                    state = obs['extra']['agent']
+                elif 'state' in obs:
+                    state = obs['state']
+                elif 'proprio' in obs:
+                    state = obs['proprio']
+            
+            if state is None:
+                # Return zeros if we can't extract state - it's less critical than images
+                return np.zeros(self.eval_state_dim, dtype=np.float32)
+            
+            # Handle tensor
+            if isinstance(state, torch.Tensor):
+                state = state.cpu().numpy()
+            
+            # Extract single env from batch
+            if state.ndim == 2:  # (B, D)
+                state = state[env_idx]
+            
+            # Ensure correct dimension (take first 8 dims if longer)
+            state = state.flatten()[:self.eval_state_dim].astype(np.float32)
+            
+            # Pad if too short
+            if len(state) < self.eval_state_dim:
+                state = np.pad(state, (0, self.eval_state_dim - len(state)))
+            
+            return state
+            
+        except Exception as e:
+            return None
+
+    def _format_actions_for_env(self, actions, env, num_parallel):
+        """Format actions for the environment."""
+        try:
+            env_unwrapped = env.unwrapped if hasattr(env, 'unwrapped') else env
+            is_multi_agent = hasattr(env_unwrapped, 'agent') and hasattr(env_unwrapped.agent, 'agents')
+            
+            if is_multi_agent:
+                num_agents = len(env_unwrapped.agent.agents)
+                if num_parallel > 1:
+                    action_batch = {}
+                    stacked_actions = np.stack(actions, axis=0)
+                    for agent_idx in range(num_agents):
+                        agent_uid = f'panda-{agent_idx}'
+                        if agent_idx == 0:
+                            action_batch[agent_uid] = stacked_actions
+                        else:
+                            action_batch[agent_uid] = np.zeros_like(stacked_actions)
+                else:
+                    action_batch = {}
+                    for agent_idx in range(num_agents):
+                        agent_uid = f'panda-{agent_idx}'
+                        if agent_idx == 0:
+                            action_batch[agent_uid] = actions[0]
+                        else:
+                            action_batch[agent_uid] = np.zeros_like(actions[0])
+            else:
+                if num_parallel > 1:
+                    action_batch = np.stack(actions, axis=0)
+                else:
+                    action_batch = actions[0]
+            
+            return action_batch
+        except Exception as e:
+            print(f"Warning: Could not format actions: {e}")
+            return actions[0] if len(actions) == 1 else np.stack(actions, axis=0)
+
+    def _to_numpy(self, x):
+        """Convert tensor to numpy."""
+        if isinstance(x, torch.Tensor):
+            return x.detach().cpu().numpy()
+        return np.array(x) if not np.isscalar(x) else x
 
     def run(self):
         cfg = copy.deepcopy(self.cfg)
@@ -282,16 +912,32 @@ class RobotWorkspace(BaseWorkspace):
 
         # Configure logging (only on main process)
         if is_main_process():
+            # Filter out custom logging options that wandb.init() doesn't accept
+            wandb_kwargs = {
+                'project': cfg.logging.project,
+                'name': cfg.logging.name,
+                'mode': cfg.logging.mode,
+                'resume': cfg.logging.resume,
+                'tags': list(cfg.logging.tags) if hasattr(cfg.logging, 'tags') and cfg.logging.tags else None,
+                'id': cfg.logging.id if hasattr(cfg.logging, 'id') else None,
+                'group': cfg.logging.group if hasattr(cfg.logging, 'group') else None,
+            }
+            # Remove None values
+            wandb_kwargs = {k: v for k, v in wandb_kwargs.items() if v is not None}
+            
             wandb_run = wandb.init(
                 dir=str(self.output_dir),
                 config=OmegaConf.to_container(cfg, resolve=True),
-                **cfg.logging
+                **wandb_kwargs
             )
+            # Log model architecture info (aligned with OpenVLA)
             wandb.config.update({
                 "output_dir": self.output_dir,
                 "distributed": self.distributed,
                 "world_size": self.world_size,
-            })
+                "model_parameters": sum(p.numel() for p in self.model.parameters()),
+                "trainable_parameters": sum(p.numel() for p in self.model.parameters() if p.requires_grad),
+            }, allow_val_change=True)
 
         # Configure checkpoint
         topk_manager = TopKCheckpointManager(
@@ -325,6 +971,14 @@ class RobotWorkspace(BaseWorkspace):
         # Save batch for sampling
         train_sampling_batch = None
 
+        # Get logging config
+        log_every = getattr(cfg.logging, 'log_every_n_steps', 50)
+        log_gradients = getattr(cfg.logging, 'log_gradients', True)
+        log_lr = getattr(cfg.logging, 'log_learning_rate', True)
+        log_images = getattr(cfg.logging, 'log_images', True)
+        log_action_pred = getattr(cfg.logging, 'log_action_predictions', True)
+        max_grad_norm = getattr(cfg.training, 'max_grad_norm', 1.0)
+
         if cfg.training.debug:
             cfg.training.num_epochs = 2
             cfg.training.max_train_steps = 3
@@ -338,12 +992,17 @@ class RobotWorkspace(BaseWorkspace):
         log_path = os.path.join(self.output_dir, 'logs.json.txt')
         json_logger = JsonLogger(log_path) if is_main_process() else None
         
+        final_train_loss = 0.0
+        
         try:
             if json_logger:
                 json_logger.__enter__()
                 
             for local_epoch_idx in range(cfg.training.num_epochs):
                 step_log = dict()
+                
+                # Reset step losses for epoch
+                self.step_losses = []
                 
                 # Set epoch for distributed sampler
                 if train_sampler is not None:
@@ -382,19 +1041,30 @@ class RobotWorkspace(BaseWorkspace):
 
                     # Step optimizer
                     if self.global_step % cfg.training.gradient_accumulate_every == 0:
+                        # Compute gradient norm before clipping
+                        grad_norm = None
+                        if is_main_process() and log_gradients:
+                            grad_norm = self._compute_grad_norm()
+                        
+                        # Gradient clipping
+                        if max_grad_norm > 0:
+                            torch.nn.utils.clip_grad_norm_(
+                                self.model.parameters(),
+                                max_grad_norm
+                            )
+                        
                         self.optimizer.step()
                         self.optimizer.zero_grad()
                         lr_scheduler.step()
                     
-                    # Update ema (only on main process or sync across all)
+                    # Update ema
                     if cfg.training.use_ema:
-                        # Use the underlying model for EMA, not the DDP wrapper
                         ema.step(self.model)
 
                     # Logging
                     raw_loss_cpu = raw_loss.item()
                     
-                    # Reduce loss across all processes for accurate logging
+                    # Reduce loss across all processes
                     if self.distributed:
                         loss_tensor = torch.tensor([raw_loss_cpu], device=device)
                         dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
@@ -402,20 +1072,40 @@ class RobotWorkspace(BaseWorkspace):
                     
                     if is_main_process():
                         dataloader_iter.set_postfix(loss=raw_loss_cpu, refresh=False)
+                    
+                    # Track step losses
+                    self.step_losses.append(raw_loss_cpu)
                     train_losses.append(raw_loss_cpu)
                     
-                    step_log = {
-                        'train_loss': raw_loss_cpu,
-                        'global_step': self.global_step,
-                        'epoch': self.epoch,
-                        'lr': lr_scheduler.get_last_lr()[0]
-                    }
-
                     is_last_batch = (batch_idx == (len(train_dataloader)-1))
                     if not is_last_batch:
                         if is_main_process():
+                            # Always log to JSON
+                            step_log = {
+                                'train_loss': raw_loss_cpu,
+                                'global_step': self.global_step,
+                                'epoch': self.epoch,
+                                'lr': lr_scheduler.get_last_lr()[0]
+                            }
                             json_logger.log(step_log)
-                            wandb.log(step_log)
+                            
+                            # Log to wandb every N steps (aligned with OpenVLA)
+                            if self.global_step % log_every == 0:
+                                wandb_log = {
+                                    'train/step_loss': raw_loss_cpu,
+                                    'train/global_step': self.global_step,
+                                }
+                                if log_lr:
+                                    wandb_log['train/learning_rate'] = lr_scheduler.get_last_lr()[0]
+                                if grad_norm is not None:
+                                    wandb_log['train/grad_norm'] = grad_norm
+                                
+                                wandb.log(wandb_log, step=self.global_step)
+                                
+                                # Log sample images periodically
+                                if log_images and self.global_step % (log_every * 10) == 0:
+                                    self._log_sample_images(batch, self.global_step)
+                        
                         self.global_step += 1
 
                     if (cfg.training.max_train_steps is not None) \
@@ -424,7 +1114,23 @@ class RobotWorkspace(BaseWorkspace):
 
                 # At the end of each epoch
                 train_loss = np.mean(train_losses)
-                step_log['train_loss'] = train_loss
+                final_train_loss = train_loss
+                
+                # Epoch metrics with statistics (aligned with OpenVLA)
+                epoch_metrics = {
+                    'epoch': self.epoch,
+                    'train/epoch_loss': train_loss,
+                    'train/epoch_loss_std': np.std(self.step_losses) if self.step_losses else 0.0,
+                    'train/epoch_loss_min': min(self.step_losses) if self.step_losses else 0.0,
+                    'train/epoch_loss_max': max(self.step_losses) if self.step_losses else 0.0,
+                }
+                
+                # Track and save best loss
+                if train_loss < self.best_loss:
+                    self.best_loss = train_loss
+                    if is_main_process():
+                        save_name = pathlib.Path(self.cfg.task.dataset.zarr_path).stem
+                        self.save_checkpoint(f'checkpoints/{save_name}/best.ckpt')
 
                 # ========= eval for this epoch ==========
                 policy = self.model
@@ -447,7 +1153,7 @@ class RobotWorkspace(BaseWorkspace):
                                     break
                         if len(val_losses) > 0:
                             val_loss = torch.mean(torch.tensor(val_losses)).item()
-                            step_log['val_loss'] = val_loss
+                            epoch_metrics['eval/val_loss'] = val_loss
 
                 # Run diffusion sampling on a training batch (only on main process)
                 if is_main_process() and (self.epoch % cfg.training.sample_every) == 0:
@@ -459,13 +1165,27 @@ class RobotWorkspace(BaseWorkspace):
                         result = policy.predict_action(obs_dict)
                         pred_action = result['action_pred']
                         mse = torch.nn.functional.mse_loss(pred_action, gt_action)
-                        step_log['train_action_mse_error'] = mse.item()
+                        epoch_metrics['eval/train_action_mse'] = mse.item()
+                        
+                        # Log action predictions visualization
+                        if log_action_pred:
+                            self._log_action_predictions(gt_action, pred_action, self.global_step)
+                        
                         del batch
                         del obs_dict
                         del gt_action
                         del result
                         del pred_action
                         del mse
+                
+                # Run simulation evaluation
+                eval_every = getattr(cfg.training, 'eval_sim_every_n_epochs', 50)
+                if is_main_process() and getattr(cfg.training, 'eval_in_sim', False):
+                    if (self.epoch + 1) % eval_every == 0:
+                        sim_metrics = self._evaluate_in_simulation(policy)
+                        if sim_metrics:
+                            epoch_metrics.update(sim_metrics)
+                            print(f"Simulation eval: {sim_metrics}")
                 
                 # Checkpoint (only on main process)
                 if is_main_process() and ((self.epoch + 1) % cfg.training.checkpoint_every) == 0:
@@ -479,16 +1199,34 @@ class RobotWorkspace(BaseWorkspace):
                 # ========= eval end for this epoch ==========
                 policy.train()
 
-                # End of epoch
+                # End of epoch logging
                 if is_main_process():
-                    json_logger.log(step_log)
-                    wandb.log(step_log)
+                    json_logger.log(epoch_metrics)
+                    wandb.log(epoch_metrics, step=self.global_step)
+                
                 self.global_step += 1
                 self.epoch += 1
+
+            # Final summary (aligned with OpenVLA)
+            if is_main_process():
+                if cfg.logging.mode == "online":
+                    wandb.run.summary["final_train_loss"] = final_train_loss
+                    wandb.run.summary["best_loss"] = self.best_loss
+                    wandb.run.summary["total_epochs"] = self.epoch
+                    wandb.finish()
                 
         finally:
             if json_logger:
                 json_logger.__exit__(None, None, None)
+            
+            # Cleanup eval environment
+            if self.eval_env is not None:
+                try:
+                    self.eval_env.close()
+                    self.eval_env = None
+                except:
+                    pass
+            
             cleanup_distributed()
 
     def _create_dataloader(self, dataset, *, batch_size: int, shuffle: bool, 
