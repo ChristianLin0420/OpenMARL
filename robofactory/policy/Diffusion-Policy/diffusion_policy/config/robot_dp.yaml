@@ -102,7 +102,7 @@ training:
   # optimization
   lr_scheduler: cosine
   lr_warmup_steps: 500
-  num_epochs: 300
+  num_epochs: 500
   gradient_accumulate_every: 1
   max_grad_norm: 1.0
   # EMA destroys performance when used with BatchNorm
@@ -112,7 +112,7 @@ training:
   # training loop control
   # in epochs
   rollout_every: 50
-  checkpoint_every: 150
+  checkpoint_every: 100
   val_every: 1
   sample_every: 5
   # steps per epoch
@@ -141,8 +141,8 @@ logging:
   log_every_n_steps: 50            # Log to wandb every N steps
   log_gradients: True              # Log gradient norms
   log_learning_rate: True          # Log learning rate
-  log_images: False                 # Log sample observations
-  log_action_predictions: False     # Log predicted vs GT actions
+  log_images: True                 # Log sample observations
+  log_action_predictions: True     # Log predicted vs GT actions
   log_eval_video: False             # Log evaluation rollout videos
 
 checkpoint:
