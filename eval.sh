@@ -22,7 +22,7 @@ set -e
 POLICY="dp"
 TASK=""
 CONFIG=""
-DATA_NUM=150
+DATA_NUM=160
 CHECKPOINT_NUM=300
 DEBUG_MODE=0
 SEED_START=1000
@@ -70,7 +70,7 @@ show_help() {
     echo ""
     echo "Examples:"
     echo "  # Evaluate single task with Diffusion Policy"
-    echo "  bash eval.sh --policy dp --task LiftBarrier-rf --config configs/table/lift_barrier.yaml"
+    echo "  bash eval.i neesh --policy dp --task LiftBarrier-rf --config configs/table/lift_barrier.yaml"
     echo ""
     echo "  # Evaluate single task with OpenVLA"
     echo "  bash eval.sh --policy openvla --task LiftBarrier-rf --config configs/table/lift_barrier.yaml"

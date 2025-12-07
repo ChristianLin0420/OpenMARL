@@ -7,7 +7,7 @@ _target_: diffusion_policy.workspace.robotworkspace.RobotWorkspace
 
 task_name: ${task.name}
 shape_meta: ${task.shape_meta}
-exp_name: "dp"  # Changed from "diffusion_policy" - shorter like OpenVLA's "openvla"
+exp_name: "diffusion_policy"
 agent_id: 0  # Override via command line: agent_id=0, agent_id=1, etc.
 
 horizon: 8
@@ -122,7 +122,7 @@ training:
   tqdm_interval_sec: 1.0
   
   # Simulation evaluation with parallel CPU envs
-  eval_in_sim: True
+  eval_in_sim: False
   eval_sim_every_n_epochs: 50     # Run sim eval every 50 epochs
   eval_sim_episodes: 8            # Number of evaluation episodes
   eval_sim_num_envs: 8            # Parallel envs on CPU (use 8 of 16 CPUs)
@@ -132,8 +132,8 @@ logging:
   project: "openmarl"
   resume: True
   mode: online
-  name: "${task_name}_${exp_name}_Agent${agent_id}"  # Will produce: "LiftBarrier-rf_dp_Agent0"
-  tags: ["${exp_name}", "${task_name}", "Agent${agent_id}"]  # Simplified, removed redundant ${name}
+  name: "${task_name}_${exp_name}_Agent${agent_id}"
+  tags: ["${name}", "${task_name}", "${exp_name}", "Agent${agent_id}"]
   id: null
   group: null
   
@@ -155,14 +155,14 @@ checkpoint:
   save_last_snapshot: False
 
 multi_run:
-  run_dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
+  run_dir: logs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
   wandb_name_base: ${now:%Y.%m.%d-%H.%M.%S}_${name}_${task_name}
 
 hydra:
   job:
     override_dirname: ${name}
   run:
-    dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
+    dir: logs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
   sweep:
-    dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
+    dir: logs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
     subdir: ${hydra.job.num}

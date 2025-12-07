@@ -1,9 +1,21 @@
 import sys
-sys.path.append('./') 
-sys.path.insert(0, './policy/Diffusion-Policy') 
-
-import torch  
 import os
+import pathlib
+
+# Add robofactory parent directory to path
+_script_dir = pathlib.Path(__file__).parent.resolve()
+_robofactory_dir = _script_dir.parent.parent  # policy/Diffusion-Policy -> policy -> robofactory
+_robofactory_parent = _robofactory_dir.parent  # robofactory -> parent (workspace)
+sys.path.insert(0, str(_robofactory_parent))
+sys.path.insert(0, str(_script_dir))
+
+# Clear DDP environment variables for single-GPU evaluation
+# This prevents RobotWorkspace from trying to initialize distributed training
+for _key in ['RANK', 'WORLD_SIZE', 'LOCAL_RANK', 'MASTER_ADDR', 'MASTER_PORT']:
+    if _key in os.environ:
+        del os.environ[_key]
+
+import torch
 
 import hydra
 from pathlib import Path
