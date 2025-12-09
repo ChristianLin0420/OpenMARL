@@ -207,7 +207,7 @@ class RobotWorkspace(BaseWorkspace):
     - Best model checkpointing
     """
     
-    include_keys = ['global_step', 'epoch']
+    include_keys = ['global_step', 'epoch', 'wandb_run_id']
 
     def __init__(self, cfg: OmegaConf, output_dir=None):
         super().__init__(cfg, output_dir=output_dir)
@@ -237,6 +237,7 @@ class RobotWorkspace(BaseWorkspace):
         # Training state
         self.global_step = 0
         self.epoch = 0
+        self.wandb_run_id = None  # Will be set after wandb.init() and saved for resumption
         
         # Best loss tracking (aligned with OpenVLA)
         self.best_loss = float('inf')
@@ -247,6 +248,36 @@ class RobotWorkspace(BaseWorkspace):
         # Evaluation environment (lazy init)
         self.eval_env = None
         self.eval_env_id = None
+
+        # Deterministic checkpoint directory based on zarr dataset name
+        # Use absolute path - parents[4] is robofactory/
+        project_root = pathlib.Path(__file__).resolve().parents[4]
+        zarr_stem = pathlib.Path(cfg.task.dataset.zarr_path).stem  # e.g., "PassShoe-rf_Agent0_160"
+        self.checkpoint_base_dir = project_root / "checkpoints" / f"{cfg.exp_name}" / zarr_stem
+
+    def get_latest_checkpoint_path(self):
+        """Find the checkpoint with the highest epoch number in the deterministic checkpoint dir."""
+        ckpt_dir = self.checkpoint_base_dir
+        
+        if not ckpt_dir.exists():
+            return None
+        
+        # Find all numbered checkpoint files
+        max_epoch = -1
+        best_ckpt = None
+        
+        for ckpt_file in ckpt_dir.glob('*.ckpt'):
+            name = ckpt_file.stem  # e.g., "100", "200", "best"
+            try:
+                epoch = int(name)
+                if epoch > max_epoch:
+                    max_epoch = epoch
+                    best_ckpt = ckpt_file
+            except ValueError:
+                # Not a numbered checkpoint (e.g., "best"), skip
+                pass
+        
+        return best_ckpt
 
     def _compute_grad_norm(self) -> float:
         """Compute the total gradient norm (aligned with OpenVLA)."""
@@ -849,13 +880,27 @@ class RobotWorkspace(BaseWorkspace):
     def run(self):
         cfg = copy.deepcopy(self.cfg)
 
-        # Resume training
+        # Resume training - automatically find highest numbered checkpoint
         if cfg.training.resume:
-            lastest_ckpt_path = self.get_checkpoint_path()
-            if lastest_ckpt_path.is_file():
+            latest_ckpt_path = self.get_latest_checkpoint_path()
+            if latest_ckpt_path is not None and latest_ckpt_path.is_file():
                 if is_main_process():
-                    print(f"Resuming from checkpoint {lastest_ckpt_path}")
-                self.load_checkpoint(path=lastest_ckpt_path)
+                    print(f"Resuming from checkpoint {latest_ckpt_path}")
+                self.load_checkpoint(path=latest_ckpt_path)
+                
+                # Use checkpoint filename to determine completed epochs (backward compatibility)
+                # e.g., "500.ckpt" means 500 epochs completed, start from 500
+                try:
+                    completed_epochs = int(latest_ckpt_path.stem)
+                    if self.epoch < completed_epochs:
+                        if is_main_process():
+                            print(f"Adjusting epoch from {self.epoch} to {completed_epochs} (from checkpoint name)")
+                        self.epoch = completed_epochs
+                except ValueError:
+                    pass  # Not a numbered checkpoint (e.g., "best.ckpt")
+            else:
+                if is_main_process():
+                    print(f"No checkpoint found in {self.checkpoint_base_dir}, starting fresh")
 
         # Configure dataset
         dataset: BaseImageDataset
@@ -910,16 +955,24 @@ class RobotWorkspace(BaseWorkspace):
 
         env_runner = None
 
-        # Configure logging (only on main process)
-        if is_main_process():
+        # Check if training should be skipped (already complete)
+        training_complete = self.epoch >= cfg.training.num_epochs
+        if training_complete and is_main_process():
+            print(f"Training already complete ({self.epoch}/{cfg.training.num_epochs} epochs). Skipping.")
+        
+        # Configure logging (only on main process AND if training will run)
+        if is_main_process() and not training_complete:
+            # Determine run ID: use saved ID from checkpoint if available, else from config
+            run_id = self.wandb_run_id or (cfg.logging.id if hasattr(cfg.logging, 'id') else None)
+            
             # Filter out custom logging options that wandb.init() doesn't accept
             wandb_kwargs = {
                 'project': cfg.logging.project,
                 'name': cfg.logging.name,
                 'mode': cfg.logging.mode,
-                'resume': cfg.logging.resume,
+                'resume': 'allow' if run_id else False,  # Only resume if we have a run ID
                 'tags': list(cfg.logging.tags) if hasattr(cfg.logging, 'tags') and cfg.logging.tags else None,
-                'id': cfg.logging.id if hasattr(cfg.logging, 'id') else None,
+                'id': run_id,
                 'group': cfg.logging.group if hasattr(cfg.logging, 'group') else None,
             }
             # Remove None values
@@ -930,6 +983,14 @@ class RobotWorkspace(BaseWorkspace):
                 config=OmegaConf.to_container(cfg, resolve=True),
                 **wandb_kwargs
             )
+            
+            # Save the run ID for future resumption (will be saved in checkpoint)
+            self.wandb_run_id = wandb_run.id
+            if run_id:
+                print(f"Resumed wandb run: {wandb_run.id}")
+            else:
+                print(f"Started new wandb run: {wandb_run.id}")
+            
             # Log model architecture info (aligned with OpenVLA)
             wandb.config.update({
                 "output_dir": self.output_dir,
@@ -997,8 +1058,12 @@ class RobotWorkspace(BaseWorkspace):
         try:
             if json_logger:
                 json_logger.__enter__()
+            
+            # Skip training if already complete
+            if training_complete:
+                return
                 
-            for local_epoch_idx in range(cfg.training.num_epochs):
+            for local_epoch_idx in range(self.epoch, cfg.training.num_epochs):
                 step_log = dict()
                 
                 # Reset step losses for epoch
@@ -1130,7 +1195,7 @@ class RobotWorkspace(BaseWorkspace):
                     self.best_loss = train_loss
                     if is_main_process():
                         save_name = pathlib.Path(self.cfg.task.dataset.zarr_path).stem
-                        self.save_checkpoint(f'checkpoints/{save_name}/best.ckpt')
+                        self.save_checkpoint(f'checkpoints/{self.cfg.exp_name}/{save_name}/best.ckpt')
 
                 # ========= eval for this epoch ==========
                 policy = self.model
@@ -1187,10 +1252,19 @@ class RobotWorkspace(BaseWorkspace):
                             epoch_metrics.update(sim_metrics)
                             print(f"Simulation eval: {sim_metrics}")
                 
-                # Checkpoint (only on main process)
-                if is_main_process() and ((self.epoch + 1) % cfg.training.checkpoint_every) == 0:
+                # End of epoch logging
+                if is_main_process():
+                    json_logger.log(epoch_metrics)
+                    wandb.log(epoch_metrics, step=self.global_step)
+                
+                # Increment counters FIRST
+                self.global_step += 1
+                self.epoch += 1
+
+                # Checkpoint (only on main process) - now self.epoch is already incremented
+                if is_main_process() and (self.epoch % cfg.training.checkpoint_every) == 0:
                     save_name = pathlib.Path(self.cfg.task.dataset.zarr_path).stem
-                    self.save_checkpoint(f'checkpoints/{save_name}/{self.epoch + 1}.ckpt')
+                    self.save_checkpoint(f'checkpoints/{self.cfg.exp_name}/{save_name}/{self.epoch}.ckpt')
                 
                 # Synchronize all processes before next epoch
                 if self.distributed:
@@ -1198,14 +1272,6 @@ class RobotWorkspace(BaseWorkspace):
                 
                 # ========= eval end for this epoch ==========
                 policy.train()
-
-                # End of epoch logging
-                if is_main_process():
-                    json_logger.log(epoch_metrics)
-                    wandb.log(epoch_metrics, step=self.global_step)
-                
-                self.global_step += 1
-                self.epoch += 1
 
             # Final summary (aligned with OpenVLA)
             if is_main_process():
