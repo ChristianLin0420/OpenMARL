@@ -20,6 +20,7 @@ import wandb
 from tqdm import tqdm
 from omegaconf import OmegaConf
 from PIL import Image
+import pathlib
 
 import robofactory.tasks
 from ..model.openvla_wrapper import OpenVLAModel
@@ -86,6 +87,11 @@ class OpenVLAWorkspace:
         
         # Simulation evaluation environment (lazy init)
         self.eval_env = None
+        
+        # Deterministic checkpoint path (aligned with Diffusion Policy)
+        project_root = pathlib.Path(__file__).resolve().parents[4]
+        rlds_stem = pathlib.Path(cfg.task.dataset.rlds_path).stem
+        self.checkpoint_base_dir = project_root / "checkpoints" / cfg.exp_name / rlds_stem
     
     def _set_seed(self, seed: int):
         """Set random seed for reproducibility."""
@@ -120,6 +126,25 @@ class OpenVLAWorkspace:
                 output_device=self.rank,
                 find_unused_parameters=False,  # No unused parameters in forward pass
             )
+    
+    def get_latest_checkpoint_path(self):
+        """Find the checkpoint with the highest epoch number."""
+        ckpt_dir = self.checkpoint_base_dir
+        if not ckpt_dir.exists():
+            return None
+        max_epoch = -1
+        best_ckpt = None
+        for ckpt_file in ckpt_dir.glob('*.ckpt'):
+            name = ckpt_file.stem
+            if name.startswith('epoch_'):
+                try:
+                    epoch = int(name.split('_')[1])
+                    if epoch > max_epoch:
+                        max_epoch = epoch
+                        best_ckpt = ckpt_file
+                except ValueError:
+                    pass
+        return best_ckpt
     
     def _init_optimizer(self):
         """Initialize optimizer and scheduler."""
@@ -248,11 +273,29 @@ class OpenVLAWorkspace:
         
         # Resume from checkpoint if exists
         if cfg.training.resume:
-            checkpoint_path = self.output_dir / 'checkpoints' / 'latest.ckpt'
-            if checkpoint_path.exists():
+            latest_ckpt = self.get_latest_checkpoint_path()
+            if latest_ckpt and latest_ckpt.exists():
                 if self.is_main_process:
-                    print(f"Resuming from {checkpoint_path}")
-                self.load_checkpoint(checkpoint_path)
+                    print(f"Resuming from checkpoint {latest_ckpt}")
+                self.load_checkpoint(latest_ckpt)
+                # Adjust epoch from checkpoint filename for backward compatibility
+                try:
+                    completed_epochs = int(latest_ckpt.stem.split('_')[1])
+                    if self.epoch < completed_epochs:
+                        if self.is_main_process:
+                            print(f"Adjusting epoch from {self.epoch} to {completed_epochs} (from checkpoint name)")
+                        self.epoch = completed_epochs
+                except (ValueError, IndexError):
+                    pass
+            else:
+                if self.is_main_process:
+                    print(f"No checkpoint found in {self.checkpoint_base_dir}, starting fresh")
+        
+        # Check if training is already complete
+        training_complete = self.epoch >= cfg.training.num_epochs
+        if training_complete and self.is_main_process:
+            print(f"Training already complete ({self.epoch}/{cfg.training.num_epochs} epochs). Skipping.")
+            return
         
         # Initialize wandb with resume support
         if self.is_main_process and cfg.logging.mode == "online":
@@ -307,8 +350,6 @@ class OpenVLAWorkspace:
                 
                 if cfg.logging.mode == "online":
                     wandb.log(metrics, step=self.global_step)
-                
-                print(f"Epoch {epoch}: {metrics}")
             
             # Plateau-based early stopping (stop when loss stops improving)
             current_loss = train_metrics.get('train_loss', float('inf'))
@@ -335,8 +376,10 @@ class OpenVLAWorkspace:
                 self.best_loss = current_loss
                 if self.is_main_process:
                     self.save_checkpoint(name='best.ckpt')
-                if self.is_distributed:
-                    dist.barrier()
+            
+            # Barrier OUTSIDE the conditional - always sync after best checkpoint logic
+            if self.is_distributed:
+                dist.barrier()
             
             # Simulation evaluation (optimized with GPU backend + parallel envs)
             if hasattr(cfg.training, 'eval_in_sim') and cfg.training.eval_in_sim:
@@ -472,6 +515,30 @@ class OpenVLAWorkspace:
                             step_metrics['train/learning_rate'] = self.optimizer.param_groups[0]['lr']
                         
                         wandb.log(step_metrics, step=self.global_step)
+                        
+                        # Log sample images periodically
+                        log_images = getattr(cfg.logging, 'log_images', True)
+                        if log_images and self.global_step % log_every == 0:
+                            self._log_sample_images(batch, self.global_step)
+                        
+                        # Log action predictions periodically
+                        log_action_pred = getattr(cfg.logging, 'log_action_predictions', True)
+                        if log_action_pred and self.global_step % log_every == 0:
+                            with torch.no_grad():
+                                # Use unwrapped model for inference to avoid DDP collective ops
+                                model_for_inference = self.model.model.module if self.is_distributed else self.model.model
+                                # Store original and temporarily swap
+                                original_model = self.model.model
+                                self.model.model = model_for_inference
+                                try:
+                                    pred_action = self.model.predict_action(
+                                        images[0:1],
+                                        instructions[0],
+                                        do_sample=False
+                                    )
+                                    self._log_action_predictions(actions, [pred_action], self.global_step)
+                                finally:
+                                    self.model.model = original_model
             
             # Logging
             current_loss = loss.item() * cfg.training.gradient_accumulate_every
@@ -603,7 +670,7 @@ class OpenVLAWorkspace:
                 control_mode='pd_joint_pos',  # Match dataset: 7 joints + gripper
                 render_mode='rgb_array',
                 num_envs=num_parallel,
-                sim_backend='gpu',  # GPU backend for 10-100x speedup
+                sim_backend='cpu',  # GPU backend for 10-100x speedup
             )
             
             if hasattr(cfg.task, 'config_path'):
@@ -946,6 +1013,45 @@ class OpenVLAWorkspace:
             print(f"Warning: Could not extract images: {e}")
             return None
     
+    def _log_sample_images(self, batch, step):
+        """Log sample observation images to wandb."""
+        try:
+            images = batch['image'][:4]  # Log up to 4 samples
+            wandb_images = []
+            for i, img in enumerate(images):
+                if isinstance(img, torch.Tensor):
+                    img = img.cpu().numpy()
+                if img.ndim == 3 and img.shape[0] in [1, 3, 4]:
+                    img = np.transpose(img, (1, 2, 0))
+                if img.max() <= 1.0:
+                    img = (img * 255).astype(np.uint8)
+                wandb_images.append(wandb.Image(img, caption=f"Sample {i}"))
+            wandb.log({"samples/input_observation": wandb_images}, step=step)
+        except Exception as e:
+            print(f"Warning: Could not log sample images: {e}")
+
+    def _log_action_predictions(self, gt_actions, pred_actions, step):
+        """Log ground truth vs predicted actions to wandb."""
+        try:
+            gt = gt_actions[0].cpu().numpy() if isinstance(gt_actions, torch.Tensor) else gt_actions[0]
+            if isinstance(gt, torch.Tensor):
+                gt = gt.cpu().numpy()
+            pred = pred_actions[0] if isinstance(pred_actions, list) else pred_actions
+            if isinstance(pred, torch.Tensor):
+                pred = pred.cpu().numpy()
+            
+            # Create comparison table
+            data = [[i, float(gt[i]), float(pred[i]), float(abs(gt[i] - pred[i]))] 
+                    for i in range(min(len(gt), len(pred)))]
+            table = wandb.Table(data=data, columns=["dim", "ground_truth", "predicted", "error"])
+            wandb.log({"samples/action_prediction": table}, step=step)
+            
+            # Log L2 error
+            l2_error = np.sqrt(np.sum((gt[:len(pred)] - pred[:len(gt)])**2))
+            wandb.log({"samples/action_l2_error": l2_error}, step=step)
+        except Exception as e:
+            print(f"Warning: Could not log action predictions: {e}")
+    
     @torch.no_grad()
     def _val_epoch(self):
         """Validate for one epoch."""
@@ -987,7 +1093,7 @@ class OpenVLAWorkspace:
         if not self.is_main_process:
             return
         
-        checkpoint_dir = self.output_dir / 'checkpoints' / Path(self.cfg.task.dataset.rlds_path).stem
+        checkpoint_dir = self.checkpoint_base_dir
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
         
         if name is None:
@@ -1029,9 +1135,7 @@ class OpenVLAWorkspace:
         metadata_path = checkpoint_dir.parent / 'training_state.json'
         with open(metadata_path, 'w') as f:
             json.dump(metadata, f, indent=2)
-        
-        print(f"Saved checkpoint to {checkpoint_path}")
-    
+            
     def load_checkpoint(self, path: str):
         """Load checkpoint and restore complete training state."""
         path = Path(path)

@@ -259,9 +259,9 @@ python policy/OpenVLA/openvla_policy/utils/data_conversion.py \
 | `PassShoe-rf` | 2 | Pass object between robots |
 | `PlaceFood-rf` | 2 | Place food on plate |
 | `TakePhoto-rf` | 4 | Coordinate to take photo |
-| `StackCube-rf` | 2 | Stack cubes cooperatively |
-| `StrikeCube-rf` | 2 | Strike cube to target |
-| `PickMeat-rf` | 2 | Pick up meat cooperatively |
+| `StackCube-rf` | 1 | Stack cubes cooperatively |
+| `StrikeCube-rf` | 1 | Strike cube to target |
+| `PickMeat-rf` | 1 | Pick up meat cooperatively |
 | `ThreeRobotsStackCube-rf` | 3 | Three-robot cube stacking |
 | `TwoRobotsStackCube-rf` | 2 | Two-robot cube stacking |
 | `LongPipelineDelivery-rf` | 4+ | Multi-agent pipeline delivery |

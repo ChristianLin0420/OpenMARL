@@ -45,16 +45,19 @@ run_gpu_eval() {
     local total=0
     
     for ((seed=start; seed<=end; seed++)); do
+        export PYOPENGL_PLATFORM=egl
+        export MUJOCO_GL=egl
+        export DISPLAY=""
+        
         CUDA_VISIBLE_DEVICES=$gpu_id OUTPUT=$(python ./policy/Diffusion-Policy/eval_multi_dp.py \
             --config="$CONFIG_NAME" \
             --data-num=$DATA_NUM \
             --checkpoint-num=$CHECKPOINT_NUM \
-            --render-mode="sensors" \
+            --render-mode="rgb_array" \
             -o="rgb" \
-            -b="gpu" \
+            -b="cpu" \
             -n 1 \
-            -s $seed \
-            $QUIET_FLAG 2>&1)
+            -s $seed)
         
         LAST_LINE=$(echo "$OUTPUT" | tail -n 1)
         fine=0

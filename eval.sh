@@ -23,13 +23,23 @@ POLICY="dp"
 TASK=""
 CONFIG=""
 DATA_NUM=160
-CHECKPOINT_NUM=300
+CHECKPOINT_NUM=500
 DEBUG_MODE=0
 SEED_START=1000
 NUM_EVAL=100
 MAX_STEPS=250
 ALL_TASKS=false
 RESULTS_DIR="evaluation_results"
+
+# Policy name mapping (short name -> checkpoint folder name)
+get_policy_dir_name() {
+    local policy="$1"
+    case "$policy" in
+        dp)      echo "diffusion_policy" ;;
+        openvla) echo "openvla" ;;
+        *)       echo "$policy" ;;
+    esac
+}
 
 # Colors
 RED='\033[0;31m'
@@ -175,7 +185,8 @@ get_config_file() {
 # Check if task has trained checkpoints
 is_task_trained() {
     local task_name="$1"
-    local checkpoint_dir="robofactory/checkpoints/${task_name}_Agent0_${DATA_NUM}"
+    local policy_dir=$(get_policy_dir_name "$POLICY")
+    local checkpoint_dir="robofactory/checkpoints/${policy_dir}/${task_name}_Agent0_${DATA_NUM}"
     
     if [[ -d "$checkpoint_dir" ]]; then
         # Check if checkpoint file exists
@@ -189,8 +200,9 @@ is_task_trained() {
 # Get all trained tasks
 get_trained_tasks() {
     local tasks=()
+    local policy_dir=$(get_policy_dir_name "$POLICY")
     
-    for checkpoint_dir in robofactory/checkpoints/*_Agent0_${DATA_NUM}; do
+    for checkpoint_dir in robofactory/checkpoints/${policy_dir}/*_Agent0_${DATA_NUM}; do
         if [[ -d "$checkpoint_dir" ]]; then
             local task_name=$(basename "$checkpoint_dir" | sed "s/_Agent0_${DATA_NUM}$//")
             if is_task_trained "$task_name"; then
@@ -205,9 +217,10 @@ get_trained_tasks() {
 # Get number of agents for a task
 get_agent_count() {
     local task_name="$1"
+    local policy_dir=$(get_policy_dir_name "$POLICY")
     local count=0
     
-    for agent_dir in robofactory/checkpoints/${task_name}_Agent*_${DATA_NUM}; do
+    for agent_dir in robofactory/checkpoints/${policy_dir}/${task_name}_Agent*_${DATA_NUM}; do
         if [[ -d "$agent_dir" ]]; then
             count=$((count + 1))
         fi
@@ -223,6 +236,7 @@ get_agent_count() {
 eval_diffusion_policy() {
     local task="$1"
     local config="$2"
+    local policy_dir=$(get_policy_dir_name "dp")
     
     log "${BLUE}Evaluating Diffusion Policy${NC}"
     log "  Task: ${task}"
@@ -233,7 +247,7 @@ eval_diffusion_policy() {
     cd robofactory
     
     # Check if checkpoint exists
-    local checkpoint_dir="checkpoints/${task}_Agent0_${DATA_NUM}"
+    local checkpoint_dir="checkpoints/${policy_dir}/${task}_Agent0_${DATA_NUM}"
     if [[ ! -d "$checkpoint_dir" ]]; then
         log "${RED}Error: Checkpoint directory not found: ${checkpoint_dir}${NC}"
         log "${YELLOW}Train the policy first: bash train.sh --policy dp --task ${task} --agent_id 0${NC}"
@@ -258,6 +272,7 @@ eval_diffusion_policy() {
 eval_openvla() {
     local task="$1"
     local config="$2"
+    local policy_dir=$(get_policy_dir_name "openvla")
     
     log "${BLUE}Evaluating OpenVLA${NC}"
     log "  Task: ${task}"
@@ -268,7 +283,7 @@ eval_openvla() {
     cd robofactory
     
     # Check if checkpoint exists
-    local checkpoint_dir="checkpoints/${task}_Agent0_${DATA_NUM}"
+    local checkpoint_dir="checkpoints/${policy_dir}/${task}_Agent0_${DATA_NUM}"
     if [[ ! -d "$checkpoint_dir" ]]; then
         log "${YELLOW}Warning: Checkpoint directory not found: ${checkpoint_dir}${NC}"
         log "${YELLOW}Make sure the policy is trained before evaluation${NC}"

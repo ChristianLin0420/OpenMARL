@@ -1,8 +1,10 @@
-# import sys
-# sys.path.append('./') 
-# sys.path.insert(0, './policy/Diffusion-Policy') 
-import sys
+# Setup headless rendering for parallel evaluation
 import os
+os.environ["PYOPENGL_PLATFORM"] = "egl"
+os.environ["MUJOCO_GL"] = "egl" 
+os.environ["DISPLAY"] = ""
+
+import sys
 import pathlib
 
 # Add robofactory parent directory to path
@@ -108,7 +110,7 @@ class Args:
 
 def get_policy(checkpoint, output_dir, device):
     # load checkpoint
-    payload = torch.load(open('./'+checkpoint, 'rb'), pickle_module=dill)
+    payload = torch.load(open(checkpoint, 'rb'), pickle_module=dill)
     cfg = payload['cfg']
     cls = hydra.utils.get_class(cfg._target_)
     workspace = cls(cfg, output_dir=output_dir)
@@ -129,7 +131,11 @@ def get_policy(checkpoint, output_dir, device):
 
 class DP:
     def __init__(self, task_name, checkpoint_num: int, data_num: int, id: int = 0):
-        self.policy = get_policy(f'checkpoints/{task_name}_Agent{id}_{data_num}/{checkpoint_num}.ckpt', None, 'cuda:0')
+        import os
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        project_root = os.path.abspath(os.path.join(script_dir, '..', '..', '..'))
+        checkpoint_path = os.path.join(project_root, 'robofactory', 'checkpoints', 'diffusion_policy', f'{task_name}_Agent{id}_{data_num}', f'{checkpoint_num}.ckpt')
+        self.policy = get_policy(checkpoint_path, None, 'cuda:0')
         self.runner = DPRunner(output_dir=None)
 
     def update_obs(self, observation):
@@ -144,7 +150,7 @@ class DP:
 
 def get_model_input(observation, agent_pos, agent_id):
     camera_name = 'head_camera' + '_agent' + str(agent_id)
-    head_cam = np.moveaxis(observation['sensor_data'][camera_name]['rgb'].squeeze(0).numpy(), -1, 0) / 255
+    head_cam = np.moveaxis(observation['sensor_data'][camera_name]['rgb'].squeeze(0).cpu().numpy(), -1, 0) / 255
     return dict(
         head_cam = head_cam,
         agent_pos = agent_pos,
@@ -209,13 +215,13 @@ def main(args: Args):
 
     if args.seed is not None and env.action_space is not None:
         env.action_space.seed(args.seed[0])
-    if args.render_mode is not None:
-        viewer = env.render()
-        if isinstance(viewer, sapien.utils.Viewer):
-            viewer.paused = args.pause
-        env.render()
+    # if args.render_mode is not None:
+    #     viewer = env.render()
+    #     if isinstance(viewer, sapien.utils.Viewer):
+    #         viewer.paused = args.pause
+    #     env.render()
     for id in range(agent_num):
-        initial_qpos = raw_obs['agent'][f'panda-{id}']['qpos'].squeeze(0)[:-2].numpy()
+        initial_qpos = raw_obs['agent'][f'panda-{id}']['qpos'].squeeze(0)[:-2].cpu().numpy()
         initial_qpos = np.append(initial_qpos, planner.gripper_state[id])
         obs = get_model_input(raw_obs, initial_qpos, id)
         dp_models[id].update_obs(obs)
@@ -234,7 +240,7 @@ def main(args: Args):
                 now_action = action_list[i]
                 raw_obs = env.get_obs()
                 if i == 0:
-                    current_qpos = raw_obs['agent'][f'panda-{id}']['qpos'].squeeze(0)[:-2].numpy()
+                    current_qpos = raw_obs['agent'][f'panda-{id}']['qpos'].squeeze(0)[:-2].cpu().numpy()
                 else:
                     current_qpos = action_list[i - 1][:-1]
                 path = np.vstack((current_qpos, now_action[:-1]))
@@ -269,8 +275,8 @@ def main(args: Args):
                     now_step = min(j, action_step_dict[f'panda-{id}'][i] - 1)
                     true_action[f'panda-{id}'] = action_dict[f'panda-{id}'][start_idx[id] + now_step]
                 observation, reward, terminated, truncated, info = env.step(true_action)
-                if verbose:
-                    env.render_human()
+                # if verbose:
+                #     env.render_human()
             if verbose:
                 print(true_action)
                 print("max_step", max_step)
@@ -282,8 +288,8 @@ def main(args: Args):
                 dp_models[id].update_obs(obs)
         if verbose:
             print("info", info)
-        if args.render_mode is not None:
-            env.render()
+        # if args.render_mode is not None:
+        #     env.render()
         if info['success'] == True:
             env.close()
             if record_dir:
