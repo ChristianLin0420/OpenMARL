@@ -58,6 +58,7 @@ run_gpu_eval() {
             -b="cpu" \
             -n 1 \
             -s $seed)
+            # $QUIET_FLAG 2>&1)
         
         LAST_LINE=$(echo "$OUTPUT" | tail -n 1)
         fine=0

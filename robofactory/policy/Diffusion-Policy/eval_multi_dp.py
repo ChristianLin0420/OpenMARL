@@ -148,12 +148,13 @@ class DP:
     def get_last_obs(self):
         return self.runner.obs[-1]
 
-def get_model_input(observation, agent_pos, agent_id):
-    camera_name = 'head_camera' + '_agent' + str(agent_id)
+def get_model_input(observation, agent_pos, agent_id, is_multi_agent=True):
+    # Camera is always named head_camera_agent{id}, even for single-agent envs
+    camera_name = f'head_camera_agent{agent_id}'
     head_cam = np.moveaxis(observation['sensor_data'][camera_name]['rgb'].squeeze(0).cpu().numpy(), -1, 0) / 255
     return dict(
-        head_cam = head_cam,
-        agent_pos = agent_pos,
+        head_cam=head_cam,
+        agent_pos=agent_pos,
     )
 
 def main(args: Args):
@@ -197,14 +198,26 @@ def main(args: Args):
         record_dir = record_dir.format(env_id=env_id)
         env = RecordEpisodeMA(env, record_dir, info_on_video=False, save_trajectory=False, max_steps_per_video=30000)
     raw_obs, _ = env.reset(seed=args.seed[0])
+
+    # Check if it's multi-agent environment
+    env_unwrapped = env.unwrapped if hasattr(env, 'unwrapped') else env
+    is_multi_agent = hasattr(env_unwrapped, 'agent') and hasattr(env_unwrapped.agent, 'agents')
+
+    if is_multi_agent:
+        agents_list = env_unwrapped.agent.agents
+    else:
+        agents_list = [env_unwrapped.agent]
+
+    base_pose = [agent.robot.pose for agent in agents_list]
+
     planner = PandaArmMotionPlanningSolver(
         env,
         debug=False,
         vis=verbose,
-        base_pose=[agent.robot.pose for agent in env.agent.agents],
+        base_pose=base_pose,
         visualize_target_grasp_pose=verbose,
         print_env_info=False,
-        is_multi_agent=True
+        is_multi_agent=is_multi_agent
     )
 
     # Load multi dp policy
@@ -221,9 +234,12 @@ def main(args: Args):
     #         viewer.paused = args.pause
     #     env.render()
     for id in range(agent_num):
-        initial_qpos = raw_obs['agent'][f'panda-{id}']['qpos'].squeeze(0)[:-2].cpu().numpy()
+        if planner.is_multi_agent:
+            initial_qpos = raw_obs['agent'][f'panda-{id}']['qpos'].squeeze(0)[:-2].cpu().numpy()
+        else:
+            initial_qpos = raw_obs['agent']['qpos'].squeeze(0)[:-2].cpu().numpy()
         initial_qpos = np.append(initial_qpos, planner.gripper_state[id])
-        obs = get_model_input(raw_obs, initial_qpos, id)
+        obs = get_model_input(raw_obs, initial_qpos, id, planner.is_multi_agent)
         dp_models[id].update_obs(obs)
     cnt = 0
     while True:
@@ -240,7 +256,10 @@ def main(args: Args):
                 now_action = action_list[i]
                 raw_obs = env.get_obs()
                 if i == 0:
-                    current_qpos = raw_obs['agent'][f'panda-{id}']['qpos'].squeeze(0)[:-2].cpu().numpy()
+                    if planner.is_multi_agent:
+                        current_qpos = raw_obs['agent'][f'panda-{id}']['qpos'].squeeze(0)[:-2].cpu().numpy()
+                    else:
+                        current_qpos = raw_obs['agent']['qpos'].squeeze(0)[:-2].cpu().numpy()
                 else:
                     current_qpos = action_list[i - 1][:-1]
                 path = np.vstack((current_qpos, now_action[:-1]))
@@ -270,10 +289,15 @@ def main(args: Args):
             for id in range(agent_num):
                 max_step = max(max_step, action_step_dict[f'panda-{id}'][i])
             for j in range(max_step):
-                true_action = dict()
-                for id in range(agent_num):
-                    now_step = min(j, action_step_dict[f'panda-{id}'][i] - 1)
-                    true_action[f'panda-{id}'] = action_dict[f'panda-{id}'][start_idx[id] + now_step]
+                if is_multi_agent:
+                    true_action = dict()
+                    for id in range(agent_num):
+                        now_step = min(j, action_step_dict[f'panda-{id}'][i] - 1)
+                        true_action[f'panda-{id}'] = action_dict[f'panda-{id}'][start_idx[id] + now_step]
+                else:
+                    # Single agent: use plain array, not dict
+                    now_step = min(j, action_step_dict['panda-0'][i] - 1)
+                    true_action = action_dict['panda-0'][start_idx[0] + now_step]
                 observation, reward, terminated, truncated, info = env.step(true_action)
                 # if verbose:
                 #     env.render_human()
@@ -284,7 +308,11 @@ def main(args: Args):
                 start_idx[id] += action_step_dict[f'panda-{id}'][i]
                 if action_step_dict[f'panda-{id}'][i] == 0:
                     continue
-                obs = get_model_input(observation, true_action[f'panda-{id}'], id)
+                if is_multi_agent:
+                    action_for_obs = true_action[f'panda-{id}']
+                else:
+                    action_for_obs = true_action
+                obs = get_model_input(observation, action_for_obs, id, is_multi_agent)
                 dp_models[id].update_obs(obs)
         if verbose:
             print("info", info)

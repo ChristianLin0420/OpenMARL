@@ -66,6 +66,7 @@ interactive.sh
 train.sh
 sbatch.sh
 sbatch_openvla.sh
+sbatch_evaluation.sh
 auto.sh
 
 # Logs
