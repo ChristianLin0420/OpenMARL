@@ -278,7 +278,7 @@ eval_openvla() {
     log "  Task: ${task}"
     log "  Config: ${config}"
     log "  Checkpoint: ${CHECKPOINT_NUM}"
-    log "  Max Steps: ${MAX_STEPS}"
+    log "  Episodes: ${NUM_EVAL}"
     
     cd robofactory
     
@@ -294,13 +294,13 @@ eval_openvla() {
     # Use config path relative to robofactory
     local relative_config="${config#robofactory/}"
     
-    python policy/OpenVLA/eval_multi_openvla.py \
-        --config "$relative_config" \
-        --data_num "$DATA_NUM" \
-        --checkpoint_num "$CHECKPOINT_NUM" \
-        --debug "$DEBUG_MODE" \
-        --seed "$SEED_START" \
-        --max_steps "$MAX_STEPS"
+    # Call eval_multi.sh for parallel multi-GPU evaluation (same as Diffusion Policy)
+    bash policy/OpenVLA/eval_multi.sh \
+        "$relative_config" \
+        "$DATA_NUM" \
+        "$CHECKPOINT_NUM" \
+        "$DEBUG_MODE" \
+        "$task"
     
     cd ..
     return 0

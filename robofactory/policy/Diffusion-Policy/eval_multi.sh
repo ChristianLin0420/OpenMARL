@@ -15,12 +15,12 @@ DEBUG_MODE="${4:-0}"
 TASK_NAME="${5:-$CONFIG_NAME}"
 
 # Number of GPUs to use
-NUM_GPUS=8
+NUM_GPUS=1
 START_SEED=1000
 END_SEED=1099
 TOTAL_SEEDS=$((END_SEED - START_SEED + 1))
 
-LOG_FILE="eval_results_${TASK_NAME}_${DATA_NUM}_${CHECKPOINT_NUM}_$(date +"%Y%m%d_%H%M%S").log"
+LOG_FILE="eval_results_diffusion_policy_${TASK_NAME}_${DATA_NUM}_${CHECKPOINT_NUM}_$(date +"%Y%m%d_%H%M%S").log"
 TEMP_DIR=$(mktemp -d)
 
 echo "Evaluating task: $TASK_NAME"

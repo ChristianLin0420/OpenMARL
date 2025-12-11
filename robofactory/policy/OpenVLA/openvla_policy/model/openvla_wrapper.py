@@ -463,6 +463,7 @@ class OpenVLAModel(nn.Module):
         
         # Create wrapper instance
         wrapper = cls.__new__(cls)
+        nn.Module.__init__(wrapper)  # Initialize nn.Module before setting attributes
         wrapper.model = model
         wrapper.processor = processor
         wrapper.device = device

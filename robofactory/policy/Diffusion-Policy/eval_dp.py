@@ -97,7 +97,7 @@ class Args:
     checkpoint_num: int = 300
     """The number of training epoch of the checkpoint"""
 
-    record_dir: Optional[str] = './eval_video/{env_id}'
+    record_dir: Optional[str] = './eval_video/diffusion_policy/{env_id}'
     """Directory to save recordings"""
 
     max_steps: int = 250
