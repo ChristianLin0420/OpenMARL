@@ -14,8 +14,8 @@ import zarr
 import tensorflow as tf
 import tensorflow_datasets as tfds
 from tqdm import tqdm
-import concurrent.futures
-from functools import lru_cache
+
+from .task_instructions import get_task_instruction, TASK_INSTRUCTIONS
 
 
 def load_zarr_data(zarr_path: str) -> Dict[str, np.ndarray]:
@@ -168,9 +168,9 @@ def convert_zarr_to_rlds(
     output_path = os.path.join(output_dir, dataset_name)
     os.makedirs(output_path, exist_ok=True)
     
-    # Set default language instruction if not provided
+    # Set default language instruction if not provided (use centralized instructions)
     if language_instruction is None:
-        language_instruction = f"Complete the {task_name.replace('-rf', '')} task"
+        language_instruction = get_task_instruction(task_name)
     
     print(f"Converting {len(episode_ends)} episodes to RLDS format...")
     
@@ -289,9 +289,9 @@ def convert_zarr_to_rlds_global(
     output_path = os.path.join(output_dir, dataset_name)
     os.makedirs(output_path, exist_ok=True)
     
-    # Set default language instruction if not provided
+    # Set default language instruction if not provided (use centralized instructions)
     if language_instruction is None:
-        language_instruction = f"Observe the {task_name.replace('-rf', '')} task from global view"
+        language_instruction = get_task_instruction(task_name, is_global_view=True)
     
     print(f"Converting {len(episode_ends)} episodes to RLDS format (global view)...")
     
@@ -351,22 +351,13 @@ def convert_zarr_to_rlds_global(
     return output_path
 
 
-def _encode_image_jpeg(image: np.ndarray, quality: int = 95) -> bytes:
-    """Encode image to JPEG bytes (much faster than PNG)."""
-    return tf.io.encode_jpeg(image, quality=quality).numpy()
-
-
-def _save_episodes_as_tfrecord_global(episodes: List[Dict], output_path: str, 
-                                       num_workers: int = 16, jpeg_quality: int = 95):
+def _save_episodes_as_tfrecord_global(episodes: List[Dict], output_path: str):
     """
     Save global camera episodes as TFRecord format (no actions).
-    Uses parallel JPEG encoding for speed.
     
     Args:
         episodes: List of episode dictionaries
         output_path: Path to save TFRecord file
-        num_workers: Number of parallel workers for image encoding
-        jpeg_quality: JPEG quality (0-100)
     """
     def _bytes_feature(value):
         """Returns a bytes_list from a string / byte."""
@@ -377,89 +368,48 @@ def _save_episodes_as_tfrecord_global(episodes: List[Dict], output_path: str,
     def _int64_feature(value):
         """Returns an int64_list from a bool / enum / int / uint."""
         return tf.train.Feature(int64_list=tf.train.Int64List(value=[value]))
-    
-    # Collect all steps and images for parallel encoding
-    all_steps = []
-    all_images = []  # (step_idx, image_key, image_data)
-    
-    for episode in episodes:
-        for step in episode['steps']:
-            step_idx = len(all_steps)
-            all_steps.append(step)
-            
-            if 'global_image' in step['observation']:
-                all_images.append((step_idx, 'global_image', step['observation']['global_image']))
-            if 'image' in step['observation']:
-                # Only add if different from global_image
-                if 'global_image' not in step['observation']:
-                    all_images.append((step_idx, 'image', step['observation']['image']))
-    
-    # Parallel encode all images
-    print(f"  Encoding {len(all_images)} images with {num_workers} workers (JPEG quality={jpeg_quality})...")
-    
-    def encode_single(args):
-        step_idx, key, image = args
-        return (step_idx, key, _encode_image_jpeg(image, jpeg_quality))
-    
-    with concurrent.futures.ThreadPoolExecutor(max_workers=num_workers) as executor:
-        encoded_results = list(executor.map(encode_single, all_images))
-    
-    # Build lookup for encoded images
-    encoded_lookup = {}
-    for step_idx, key, encoded_bytes in encoded_results:
-        if step_idx not in encoded_lookup:
-            encoded_lookup[step_idx] = {}
-        encoded_lookup[step_idx][key] = encoded_bytes
-    
-    # Cache for language instructions
-    instruction_cache = {}
-    
-    # Write TFRecord
-    print(f"  Writing TFRecord with {len(all_steps)} steps...")
+
     with tf.io.TFRecordWriter(output_path) as writer:
-        for step_idx, step in enumerate(all_steps):
-            # Cache language instruction encoding
-            instruction = step['language_instruction']
-            if instruction not in instruction_cache:
-                instruction_cache[instruction] = instruction.encode('utf-8')
-            
-            feature = {
-                'is_first': _int64_feature(int(step['is_first'])),
-                'is_last': _int64_feature(int(step['is_last'])),
-                'is_terminal': _int64_feature(int(step['is_terminal'])),
-                'language_instruction': _bytes_feature(instruction_cache[instruction]),
-            }
-            
-            # Add pre-encoded images
-            if step_idx in encoded_lookup:
-                if 'global_image' in encoded_lookup[step_idx]:
+        for episode in episodes:
+            for step in episode['steps']:
+                # Create feature dictionary (no action for global view)
+                feature = {
+                    'is_first': _int64_feature(int(step['is_first'])),
+                    'is_last': _int64_feature(int(step['is_last'])),
+                    'is_terminal': _int64_feature(int(step['is_terminal'])),
+                    'language_instruction': _bytes_feature(
+                        step['language_instruction'].encode('utf-8')
+                    ),
+                }
+                
+                # Add global camera image
+                if 'global_image' in step['observation']:
+                    global_image = step['observation']['global_image']
                     feature['observation/global_image'] = _bytes_feature(
-                        encoded_lookup[step_idx]['global_image']
+                        tf.io.encode_png(global_image).numpy()
                     )
-                    # Also use for backward compatible 'image' key
+                
+                # Add backward compatible image key
+                if 'image' in step['observation']:
+                    image = step['observation']['image']
                     feature['observation/image'] = _bytes_feature(
-                        encoded_lookup[step_idx]['global_image']
+                        tf.io.encode_png(image).numpy()
                     )
-                elif 'image' in encoded_lookup[step_idx]:
-                    feature['observation/image'] = _bytes_feature(
-                        encoded_lookup[step_idx]['image']
-                    )
-            
-            example = tf.train.Example(features=tf.train.Features(feature=feature))
-            writer.write(example.SerializeToString())
+                
+                # Create Example and write
+                example = tf.train.Example(
+                    features=tf.train.Features(feature=feature)
+                )
+                writer.write(example.SerializeToString())
 
 
-def _save_episodes_as_tfrecord(episodes: List[Dict], output_path: str,
-                               num_workers: int = 16, jpeg_quality: int = 95):
+def _save_episodes_as_tfrecord(episodes: List[Dict], output_path: str):
     """
     Save episodes as TFRecord format with multiple camera views.
-    Uses parallel JPEG encoding for speed.
     
     Args:
         episodes: List of episode dictionaries
         output_path: Path to save TFRecord file
-        num_workers: Number of parallel workers for image encoding
-        jpeg_quality: JPEG quality (0-100)
     """
     def _bytes_feature(value):
         """Returns a bytes_list from a string / byte."""
@@ -474,90 +424,53 @@ def _save_episodes_as_tfrecord(episodes: List[Dict], output_path: str,
     def _int64_feature(value):
         """Returns an int64_list from a bool / enum / int / uint."""
         return tf.train.Feature(int64_list=tf.train.Int64List(value=[value]))
-    
-    # Collect all steps and images for parallel encoding
-    all_steps = []
-    all_images = []  # (step_idx, image_key, image_data)
-    
-    for episode in episodes:
-        for step in episode['steps']:
-            step_idx = len(all_steps)
-            all_steps.append(step)
-            
-            # Collect all camera images
-            if 'wrist_image' in step['observation']:
-                all_images.append((step_idx, 'wrist_image', step['observation']['wrist_image']))
-            if 'side_image' in step['observation']:
-                all_images.append((step_idx, 'side_image', step['observation']['side_image']))
-            if 'image' in step['observation']:
-                # Only add if not already covered by wrist_image
-                if 'wrist_image' not in step['observation']:
-                    all_images.append((step_idx, 'image', step['observation']['image']))
-    
-    # Parallel encode all images
-    print(f"  Encoding {len(all_images)} images with {num_workers} workers (JPEG quality={jpeg_quality})...")
-    
-    def encode_single(args):
-        step_idx, key, image = args
-        return (step_idx, key, _encode_image_jpeg(image, jpeg_quality))
-    
-    with concurrent.futures.ThreadPoolExecutor(max_workers=num_workers) as executor:
-        encoded_results = list(executor.map(encode_single, all_images))
-    
-    # Build lookup for encoded images
-    encoded_lookup = {}
-    for step_idx, key, encoded_bytes in encoded_results:
-        if step_idx not in encoded_lookup:
-            encoded_lookup[step_idx] = {}
-        encoded_lookup[step_idx][key] = encoded_bytes
-    
-    # Cache for language instructions
-    instruction_cache = {}
-    
-    # Write TFRecord
-    print(f"  Writing TFRecord with {len(all_steps)} steps...")
+
     with tf.io.TFRecordWriter(output_path) as writer:
-        for step_idx, step in enumerate(all_steps):
-            # Cache language instruction encoding
-            instruction = step['language_instruction']
-            if instruction not in instruction_cache:
-                instruction_cache[instruction] = instruction.encode('utf-8')
-            
-            feature = {
-                'action': _float_feature(step['action'].flatten()),
-                'is_first': _int64_feature(int(step['is_first'])),
-                'is_last': _int64_feature(int(step['is_last'])),
-                'is_terminal': _int64_feature(int(step['is_terminal'])),
-                'language_instruction': _bytes_feature(instruction_cache[instruction]),
-            }
-            
-            # Add pre-encoded images
-            if step_idx in encoded_lookup:
-                if 'wrist_image' in encoded_lookup[step_idx]:
+        for episode in episodes:
+            for step in episode['steps']:
+                # Create feature dictionary
+                feature = {
+                    'action': _float_feature(step['action'].flatten()),
+                    'is_first': _int64_feature(int(step['is_first'])),
+                    'is_last': _int64_feature(int(step['is_last'])),
+                    'is_terminal': _int64_feature(int(step['is_terminal'])),
+                    'language_instruction': _bytes_feature(
+                        step['language_instruction'].encode('utf-8')
+                    ),
+                }
+                
+                # Add wrist camera (gripper view)
+                if 'wrist_image' in step['observation']:
+                    wrist_image = step['observation']['wrist_image']
                     feature['observation/wrist_image'] = _bytes_feature(
-                        encoded_lookup[step_idx]['wrist_image']
+                        tf.io.encode_png(wrist_image).numpy()
                     )
-                    # Also use for backward compatible 'image' key
-                    feature['observation/image'] = _bytes_feature(
-                        encoded_lookup[step_idx]['wrist_image']
-                    )
-                if 'side_image' in encoded_lookup[step_idx]:
+                
+                # Add side camera (head_camera view)
+                if 'side_image' in step['observation']:
+                    side_image = step['observation']['side_image']
                     feature['observation/side_image'] = _bytes_feature(
-                        encoded_lookup[step_idx]['side_image']
+                        tf.io.encode_png(side_image).numpy()
                     )
-                if 'image' in encoded_lookup[step_idx] and 'wrist_image' not in encoded_lookup[step_idx]:
+                
+                # Add default image (for backward compatibility)
+                if 'image' in step['observation']:
+                    image = step['observation']['image']
                     feature['observation/image'] = _bytes_feature(
-                        encoded_lookup[step_idx]['image']
+                        tf.io.encode_png(image).numpy()
                     )
-            
-            # Add proprio/state
-            if 'proprio' in step['observation']:
-                feature['observation/proprio'] = _float_feature(
-                    step['observation']['proprio'].flatten()
+                
+                # Add proprio/state
+                if 'proprio' in step['observation']:
+                    feature['observation/proprio'] = _float_feature(
+                        step['observation']['proprio'].flatten()
+                    )
+                
+                # Create Example and write
+                example = tf.train.Example(
+                    features=tf.train.Features(feature=feature)
                 )
-            
-            example = tf.train.Example(features=tf.train.Features(feature=feature))
-            writer.write(example.SerializeToString())
+                writer.write(example.SerializeToString())
 
 
 def batch_convert_zarr_to_rlds(
@@ -647,20 +560,11 @@ if __name__ == "__main__":
     args = parser.parse_args()
     
     if args.batch:
-        # Define task instructions
-        task_instructions = {
-            'LiftBarrier-rf': 'Lift the barrier together with the other robot',
-            'StackCube-rf': 'Stack the cube on the target location',
-            'TakePhoto-rf': 'Take a photo of the target object',
-            'PassShoe-rf': 'Pass the shoe to the other robot',
-            'PlaceFood-rf': 'Place the food on the plate',
-            'CameraAlignment-rf': 'Align the camera with the target',
-        }
-        
+        # Use centralized task instructions from task_instructions.py
         batch_convert_zarr_to_rlds(
             zarr_dir=args.zarr_path,
             output_dir=args.output_dir,
-            task_instructions=task_instructions
+            task_instructions=TASK_INSTRUCTIONS  # Use centralized instructions
         )
     else:
         # Single file conversion

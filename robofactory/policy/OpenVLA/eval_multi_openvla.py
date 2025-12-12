@@ -25,6 +25,7 @@ from robofactory.utils.wrappers.record import RecordEpisodeMA
 from robofactory.planner.motionplanner import PandaArmMotionPlanningSolver
 
 from openvla_policy.policy.openvla_policy import OpenVLAPolicy
+from openvla_policy.utils.task_instructions import get_task_instruction
 
 
 def parse_args():
@@ -70,7 +71,7 @@ def parse_args():
     parser.add_argument(
         '--record_dir',
         type=str,
-        default='./eval_video/openvla/{env_id}',
+        default='./eval_video/{env_id}',
         help='Directory to save evaluation videos'
     )
     parser.add_argument(
@@ -114,7 +115,7 @@ def get_model_input(observation, agent_pos, agent_id):
         Dictionary with 'image' and 'agent_pos'
     """
     camera_name = f'head_camera_agent{agent_id}'
-    head_cam = observation['sensor_data'][camera_name]['rgb'].squeeze(0).cpu().numpy()
+    head_cam = observation['sensor_data'][camera_name]['rgb'].squeeze(0).numpy()
     
     # Convert to HWC format if needed
     if head_cam.shape[0] == 3:
@@ -127,18 +128,8 @@ def get_model_input(observation, agent_pos, agent_id):
 
 
 def load_task_instruction(task_name: str) -> str:
-    """Get language instruction for a task."""
-    instructions = {
-        'LiftBarrier-rf': 'Lift the barrier together with the other robot',
-        'StackCube-rf': 'Stack the cube on the target location',
-        'TakePhoto-rf': 'Take a photo of the target object',
-        'PassShoe-rf': 'Pass the shoe to the other robot',
-        'PlaceFood-rf': 'Place the food on the plate',
-        'CameraAlignment-rf': 'Align the camera with the target',
-        'TwoRobotsStackCube-rf': 'Stack the cube together',
-        'ThreeRobotsStackCube-rf': 'Stack the cube with three robots',
-    }
-    return instructions.get(task_name, f'Complete the {task_name} task')
+    """Get language instruction for a task (uses centralized task_instructions module)."""
+    return get_task_instruction(task_name)
 
 
 class OpenVLAPolicyWrapper:
@@ -146,26 +137,14 @@ class OpenVLAPolicyWrapper:
     
     def __init__(self, task_name: str, checkpoint_num: int, data_num: int, agent_id: int = 0):
         """Initialize policy wrapper."""
-        # Get absolute path like DP does
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        project_root = os.path.abspath(os.path.join(script_dir, '..', '..'))  # policy/OpenVLA -> robofactory
-        
-        # Checkpoint path: checkpoints/openvla/{task}_Agent{id}/epoch_{checkpoint}
-        checkpoint_dir = os.path.join(
-            project_root, 'checkpoints', 'openvla',
-            f'{task_name}_Agent{agent_id}_{data_num}',
-            f'epoch_{checkpoint_num}'
-        )
+        # Load checkpoint
+        checkpoint_dir = f'checkpoints/{task_name}_Agent{agent_id}_{data_num}/epoch_{checkpoint_num}'
         
         if not Path(checkpoint_dir).exists():
             raise FileNotFoundError(f"Checkpoint not found: {checkpoint_dir}")
         
         # Load statistics
-        stats_path = os.path.join(
-            project_root, 'data', 'rlds_data',
-            f'{task_name}_Agent{agent_id}_{data_num}',
-            'statistics.json'
-        )
+        stats_path = f'data/rlds_data/{task_name}_Agent{agent_id}_{data_num}/statistics.json'
         import json
         if Path(stats_path).exists():
             with open(stats_path, 'r') as f:
@@ -234,7 +213,7 @@ def main(args):
         human_render_camera_configs=dict(shader_pack='default'),
         viewer_camera_configs=dict(shader_pack='default'),
         num_envs=args.num_envs,
-        sim_backend='gpu',
+        sim_backend='auto',
         enable_shadow=True,
         parallel_in_single_scene=False,
     )
@@ -289,7 +268,7 @@ def main(args):
     
     # Initialize observations
     for agent_id in range(agent_num):
-        initial_qpos = raw_obs['agent'][f'panda-{agent_id}']['qpos'].squeeze(0)[:-2].cpu().numpy()
+        initial_qpos = raw_obs['agent'][f'panda-{agent_id}']['qpos'].squeeze(0)[:-2].numpy()
         initial_qpos = np.append(initial_qpos, planner.gripper_state[agent_id])
         obs = get_model_input(raw_obs, initial_qpos, agent_id)
         openvla_models[agent_id].update_obs(obs)
@@ -331,7 +310,7 @@ def main(args):
                 raw_obs = env.get_obs()
                 
                 if i == 0:
-                    current_qpos = raw_obs['agent'][f'panda-{agent_id}']['qpos'].squeeze(0)[:-2].cpu().numpy()
+                    current_qpos = raw_obs['agent'][f'panda-{agent_id}']['qpos'].squeeze(0)[:-2].numpy()
                 else:
                     current_qpos = action_list[i - 1][:-1]
                 

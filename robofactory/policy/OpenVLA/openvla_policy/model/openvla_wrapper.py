@@ -418,6 +418,9 @@ class OpenVLAModel(nn.Module):
             import json
             with open(os.path.join(save_directory, 'action_stats.json'), 'w') as f:
                 json.dump(stats, f)
+        
+        if self._is_logging_rank:
+            print(f"Model saved to {save_directory}")
     
     @classmethod
     def from_pretrained(
@@ -463,7 +466,6 @@ class OpenVLAModel(nn.Module):
         
         # Create wrapper instance
         wrapper = cls.__new__(cls)
-        nn.Module.__init__(wrapper)  # Initialize nn.Module before setting attributes
         wrapper.model = model
         wrapper.processor = processor
         wrapper.device = device
