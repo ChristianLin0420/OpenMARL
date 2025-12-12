@@ -1,7 +1,7 @@
-"""OpenVLA model wrapper with LoRA fine-tuning support."""
+"""OpenVLA model wrapper with LoRA fine-tuning support and multi-view images."""
 
 import os
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, List, Union
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -9,6 +9,8 @@ from transformers import AutoModelForVision2Seq, AutoProcessor
 from peft import LoraConfig, get_peft_model, PeftModel
 from PIL import Image
 import numpy as np
+import torchvision.transforms.functional as TF
+import wandb
 
 
 # OpenVLA action tokenization constants
@@ -37,9 +39,14 @@ class OpenVLAModel(nn.Module):
         torch_dtype: torch.dtype = torch.bfloat16,
         device: str = "cuda",
         action_dim: int = 8,  # Default 8-DOF for Panda (7 joints + gripper)
+        # Multi-view parameters
+        use_multi_view: bool = False,
+        num_images: int = 1,
+        image_views: List[str] = None,
+        multi_view_fusion: str = "concatenate",
     ):
         """
-        Initialize OpenVLA model.
+        Initialize OpenVLA model with multi-view support.
         
         Args:
             model_name: HuggingFace model name or path
@@ -50,6 +57,10 @@ class OpenVLAModel(nn.Module):
             torch_dtype: Data type for model weights
             device: Device to load model on
             action_dim: Action dimension (default 8 for 7 joints + gripper)
+            use_multi_view: Whether to use multiple camera views
+            num_images: Number of camera views (1, 2, or 3)
+            image_views: List of view names ['primary', 'secondary', 'wrist']
+            multi_view_fusion: How to fuse views ('concatenate' or 'tile')
         """
         super().__init__()
         
@@ -59,10 +70,19 @@ class OpenVLAModel(nn.Module):
         self.device = device
         self.action_dim = action_dim
         
+        # Multi-view settings
+        self.use_multi_view = use_multi_view
+        self.num_images = num_images
+        self.image_views = image_views or ['primary', 'secondary', 'wrist']
+        self.multi_view_fusion = multi_view_fusion
+        
         # Determine logging rank (rank 1 in distributed, or single process)
         local_rank = int(os.environ.get("LOCAL_RANK", 0))
         world_size = int(os.environ.get("WORLD_SIZE", 1))
         self._is_logging_rank = (world_size == 1) or (local_rank == 1)
+        
+        if self._is_logging_rank and use_multi_view:
+            print(f"Multi-view enabled: {num_images} images, views={image_views}, fusion={multi_view_fusion}")
         
         # Load processor
         if self._is_logging_rank:
@@ -218,29 +238,83 @@ class OpenVLAModel(nn.Module):
         
         return actions
     
-    def forward(
-        self,
-        images: torch.Tensor,
-        instructions: list[str],
-        actions: Optional[torch.Tensor] = None,
-    ) -> Dict[str, torch.Tensor]:
+    def _process_multi_view_images(
+        self, 
+        images: Dict[str, torch.Tensor],
+        debug: bool = False,
+    ) -> Tuple[List[Image.Image], List[str]]:
         """
-        Forward pass for training.
-        
-        Uses the model's native language modeling objective for fine-tuning.
-        The LoRA adapters learn to predict better actions through this objective.
+        Process multiple camera views to extract individual images.
+        Each view will be processed separately to get its own visual tokens.
         
         Args:
-            images: Batch of images (B, C, H, W)
+            images: Dict of {view_name: (B, C, H, W)} tensors
+            debug: Whether to print debug info
+            
+        Returns:
+            Tuple of (list of PIL images, list of view names used)
+        """
+        batch_size = None
+        ordered_images = []
+        view_names_used = []
+        
+        for view in self.image_views:
+            if view in images:
+                img = images[view]
+                if batch_size is None:
+                    batch_size = img.shape[0]
+                ordered_images.append(img)
+                view_names_used.append(view)
+        
+        if len(ordered_images) == 0:
+            raise ValueError(f"No valid images found in multi-view dict. Expected views: {self.image_views}, got: {list(images.keys())}")
+        
+        if debug and self._is_logging_rank:
+            print(f"\n[DEBUG] Multi-view processing:")
+            print(f"  Views used: {view_names_used}")
+            print(f"  Individual shapes: {[img.shape for img in ordered_images]}")
+            print(f"  Each view will be processed separately to preserve full resolution")
+        
+        # Convert all views to PIL images (for first sample in batch)
+        pil_images = []
+        for img_tensor in ordered_images:
+            # Take first sample from batch: (C, H, W)
+            img = img_tensor[0]
+            img_np = (img.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+            pil_images.append(Image.fromarray(img_np))
+        
+        return pil_images, view_names_used
+    
+    def forward(
+        self,
+        images: Union[torch.Tensor, Dict[str, torch.Tensor]],
+        instructions: list[str],
+        actions: Optional[torch.Tensor] = None,
+        debug: bool = False,
+        return_image_tensors: bool = False,
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Forward pass for training with proper multi-view support.
+        
+        For multi-view inputs, each view is processed separately through the vision
+        encoder to get its own visual tokens, then they are concatenated in sequence
+        space (not pixel space). This preserves full resolution for each view and
+        allows the LLM to attend to each view independently.
+        
+        Args:
+            images: Batch of images (B, C, H, W) or dict of multi-view images
             instructions: List of language instructions
-            actions: Ground truth actions for training (B, action_dim) - used for auxiliary loss
+            actions: Ground truth actions for training (B, action_dim)
+            debug: Whether to print debug info for multi-view
+            return_image_tensors: Whether to return processed image tensors for logging
             
         Returns:
             Dictionary containing:
                 - 'loss': Training loss
                 - 'logits': Model logits
+                - 'image_tensors': (optional) Processed images for logging
         """
-        batch_size = images.shape[0]
+        batch_size = images.shape[0] if isinstance(images, torch.Tensor) else next(iter(images.values())).shape[0]
         
         # Format prompts
         prompts = [
@@ -248,81 +322,203 @@ class OpenVLAModel(nn.Module):
             for inst in instructions
         ]
         
-        # Process inputs
-        # Convert images from (B, C, H, W) to list of PIL Images
-        images_list = []
-        for img in images:
-            # Convert from (C, H, W) to (H, W, C) and to uint8
-            img_np = (img.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
-            images_list.append(Image.fromarray(img_np))
-        
-        # Process with processor
-        inputs = self.processor(
-            text=prompts,
-            images=images_list,
-            return_tensors="pt",
-            padding=True,
-        )
-        
-        # Move to device and convert to correct dtype
-        inputs = {
-            k: v.to(device=self.device, dtype=self.torch_dtype) if v.dtype in [torch.float32, torch.float64] else v.to(self.device)
-            for k, v in inputs.items()
-        }
-        
-        # Use the model's native language modeling objective
-        # This fine-tunes the LoRA adapters to improve action predictions
-        input_ids = inputs['input_ids']
-        attention_mask = inputs.get('attention_mask', torch.ones_like(input_ids))
-        pixel_values = inputs.get('pixel_values')
-        
-        # Create labels for language modeling (same as input, shifted internally)
-        labels = input_ids.clone()
-        
-        # Forward pass with language modeling loss
-        outputs = self.model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            pixel_values=pixel_values,
-            labels=labels,
-        )
-        
-        total_loss = outputs.loss
-        
-        # Add auxiliary action regression loss if actions are provided
-        # This helps guide the model to predict better continuous action values
-        if actions is not None and self.action_mean is not None:
-            # Get the last hidden state
-            hidden_states = outputs.logits  # (B, seq_len, vocab_size)
+        # Handle multi-view images with proper token concatenation
+        if isinstance(images, dict) and len(images) > 1:
+            # PROPER MULTI-VIEW: Process each view separately, concatenate visual tokens
+            if debug and self._is_logging_rank:
+                print(f"\n[DEBUG] Processing multi-view images: {list(images.keys())}")
             
-            # Use mean pooling of last few token logits as action representation
-            # This is a proxy for action prediction during training
-            last_hidden = hidden_states[:, -1, :]  # (B, vocab_size)
+            # We'll process only the first sample for simplicity
+            # In production, you'd want to handle full batches
+            if batch_size > 1:
+                if self._is_logging_rank and debug:
+                    print(f"[WARNING] Multi-view with batch_size > 1 not fully optimized. Processing first sample.")
             
-            # Normalize actions for the loss computation
-            normalized_actions = (actions - self.action_mean) / (self.action_std + 1e-8)
+            # Get text tokenization first
+            text_inputs = self.processor.tokenizer(
+                prompts,
+                return_tensors="pt",
+                padding=True,
+            )
+            input_ids = text_inputs['input_ids'].to(self.device)
+            attention_mask = text_inputs['attention_mask'].to(self.device)
             
-            # Note: We don't add explicit action regression loss here as it would
-            # require a separate prediction head. The language modeling objective
-            # through LoRA fine-tuning is sufficient for improving action predictions.
+            # Process each view separately to get visual embeddings
+            all_visual_embeddings = []
+            all_pil_images = []
+            view_names_used = []
+            
+            for view_name in self.image_views:
+                if view_name not in images:
+                    continue
+                    
+                view_images = images[view_name]  # (B, C, H, W)
+                
+                # Convert to PIL images
+                images_list = []
+                for img in view_images:
+                    img_np = (img.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+                    pil_img = Image.fromarray(img_np)
+                    images_list.append(pil_img)
+                    if len(all_pil_images) < batch_size:  # Store first batch for logging
+                        all_pil_images.append(img)
+                
+                # Process images for this view
+                view_inputs = self.processor.image_processor(
+                    images=images_list,
+                    return_tensors="pt",
+                )
+                pixel_values = view_inputs['pixel_values'].to(self.device, dtype=self.torch_dtype)
+                
+                # Extract visual features through vision backbone
+                with torch.set_grad_enabled(self.training):
+                    # Access the base model (unwrap DDP if needed)
+                    base_model = self.model.module if hasattr(self.model, 'module') else self.model
+                    
+                    # Get patch features: (B, num_patches, vision_embed_dim)
+                    patch_features = base_model.vision_backbone(pixel_values)
+                    
+                    # Project to LLM space: (B, num_patches, llm_embed_dim)
+                    visual_embeddings = base_model.projector(patch_features)
+                    
+                all_visual_embeddings.append(visual_embeddings)
+                view_names_used.append(view_name)
+            
+            if debug and self._is_logging_rank:
+                print(f"  Processed {len(all_visual_embeddings)} views: {view_names_used}")
+                print(f"  Visual embedding shapes: {[ve.shape for ve in all_visual_embeddings]}")
+            
+            # Concatenate all visual tokens in sequence dimension
+            # Result: (B, num_patches * num_views, llm_embed_dim)
+            combined_visual_embeddings = torch.cat(all_visual_embeddings, dim=1)
+            
+            if debug and self._is_logging_rank:
+                print(f"  Combined visual embeddings shape: {combined_visual_embeddings.shape}")
+            
+            # Get text embeddings from language model
+            base_model = self.model.module if hasattr(self.model, 'module') else self.model
+            text_embeddings = base_model.language_model.get_input_embeddings()(input_ids)
+            
+            # Build multimodal sequence: [BOS] + [all_visual_tokens] + [text_tokens]
+            multimodal_embeddings = torch.cat([
+                text_embeddings[:, :1, :],  # BOS token
+                combined_visual_embeddings,  # All visual tokens from all views
+                text_embeddings[:, 1:, :],   # Rest of text
+            ], dim=1)
+            
+            # Update attention mask for visual tokens
+            visual_attention_mask = torch.ones(
+                (batch_size, combined_visual_embeddings.shape[1]),
+                dtype=attention_mask.dtype,
+                device=attention_mask.device
+            )
+            multimodal_attention_mask = torch.cat([
+                attention_mask[:, :1],
+                visual_attention_mask,
+                attention_mask[:, 1:],
+            ], dim=1)
+            
+            # Create labels (ignore visual tokens, they don't produce text)
+            labels = input_ids.clone()
+            visual_labels = torch.full(
+                (batch_size, combined_visual_embeddings.shape[1]),
+                -100,  # IGNORE_INDEX
+                dtype=labels.dtype,
+                device=labels.device
+            )
+            multimodal_labels = torch.cat([
+                labels[:, :1],
+                visual_labels,
+                labels[:, 1:],
+            ], dim=1)
+            
+            if debug and self._is_logging_rank:
+                print(f"  Final multimodal sequence length: {multimodal_embeddings.shape[1]}")
+                print(f"    = BOS(1) + visual_tokens({combined_visual_embeddings.shape[1]}) + text({text_embeddings.shape[1]-1})")
+            
+            # Forward through language model
+            outputs = base_model.language_model(
+                inputs_embeds=multimodal_embeddings,
+                attention_mask=multimodal_attention_mask,
+                labels=multimodal_labels,
+                use_cache=False,
+            )
+            
+            result = {
+                'loss': outputs.loss,
+                'logits': outputs.logits,
+            }
+            
+            if return_image_tensors:
+                result['image_tensors'] = {view: images[view] for view in view_names_used}
+                result['view_names'] = view_names_used
+            
+            return result
         
-        return {
-            'loss': total_loss,
-            'logits': outputs.logits,
-        }
+        else:
+            # Single view - use standard processing
+            if isinstance(images, dict):
+                images = next(iter(images.values()))
+            
+            # Convert images from (B, C, H, W) to list of PIL Images
+            images_list = []
+            for img in images:
+                img_np = (img.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+                images_list.append(Image.fromarray(img_np))
+            
+            # Process with processor
+            inputs = self.processor(
+                text=prompts,
+                images=images_list,
+                return_tensors="pt",
+                padding=True,
+            )
+            
+            # Move to device and convert to correct dtype
+            inputs = {
+                k: v.to(device=self.device, dtype=self.torch_dtype) if v.dtype in [torch.float32, torch.float64] else v.to(self.device)
+                for k, v in inputs.items()
+            }
+            
+            # Use the model's native language modeling objective
+            input_ids = inputs['input_ids']
+            attention_mask = inputs.get('attention_mask', torch.ones_like(input_ids))
+            pixel_values = inputs.get('pixel_values')
+            
+            # Create labels for language modeling
+            labels = input_ids.clone()
+            
+            # Forward pass
+            outputs = self.model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                pixel_values=pixel_values,
+                labels=labels,
+            )
+            
+            result = {
+                'loss': outputs.loss,
+                'logits': outputs.logits,
+            }
+            
+            if return_image_tensors:
+                result['image_tensors'] = {'primary': images}
+                result['view_names'] = ['primary']
+            
+            return result
     
     def predict_action(
         self,
-        image: torch.Tensor,
+        image: Union[torch.Tensor, Dict[str, torch.Tensor]],
         instruction: str,
         unnorm_key: Optional[str] = "bridge_orig",
         do_sample: bool = False,
     ) -> np.ndarray:
         """
-        Predict action for a single observation.
+        Predict action for a single observation with multi-view support.
         
         Args:
-            image: Single image tensor (C, H, W) or (1, C, H, W)
+            image: Single image (C, H, W) or dict of multi-view images
             instruction: Language instruction
             unnorm_key: Key for denormalization stats (default: bridge_orig)
             do_sample: Whether to sample or use greedy decoding
@@ -330,7 +526,17 @@ class OpenVLAModel(nn.Module):
         Returns:
             Predicted action as numpy array with shape (action_dim,)
         """
-        if image.dim() == 3:
+        # Handle multi-view input
+        if isinstance(image, dict):
+            # Add batch dimension to each view
+            batched_images = {}
+            for view_name, img in image.items():
+                if img.dim() == 3:
+                    img = img.unsqueeze(0)
+                batched_images[view_name] = img
+            # Fuse views
+            image = self._fuse_multi_view_images(batched_images)
+        elif image.dim() == 3:
             image = image.unsqueeze(0)  # Add batch dimension
         
         # Convert to PIL Image

@@ -8,7 +8,7 @@ for distributed training across multiple GPUs.
 import os
 import json
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 import numpy as np
 import torch
 import torch.distributed as dist
@@ -95,11 +95,17 @@ class OpenVLAWorkspace:
             torch.cuda.manual_seed_all(seed)
     
     def _init_model(self):
-        """Initialize model with LoRA."""
+        """Initialize model with LoRA and multi-view support."""
         cfg = self.cfg
         
         # Get action_dim from config or default to 8 (Panda: 7 joints + gripper)
         action_dim = getattr(cfg.model, 'action_dim', 8)
+        
+        # Get multi-view settings from config
+        use_multi_view = getattr(cfg.model, 'use_multi_view', False)
+        num_images = getattr(cfg.model, 'num_images', 1)
+        image_views = list(getattr(cfg.model, 'image_views', ['primary', 'secondary', 'wrist']))
+        multi_view_fusion = getattr(cfg.model, 'multi_view_fusion', 'concatenate')
         
         self.model = OpenVLAModel(
             model_name=cfg.model.model_name,
@@ -110,6 +116,10 @@ class OpenVLAWorkspace:
             torch_dtype=getattr(torch, cfg.model.torch_dtype),
             device=cfg.training.device,
             action_dim=action_dim,
+            use_multi_view=use_multi_view,
+            num_images=num_images,
+            image_views=image_views,
+            multi_view_fusion=multi_view_fusion,
         )
         
         # Wrap with DDP if distributed
@@ -145,8 +155,12 @@ class OpenVLAWorkspace:
             )
     
     def _init_dataloaders(self):
-        """Initialize train and validation dataloaders."""
+        """Initialize train and validation dataloaders with multi-view support."""
         cfg = self.cfg
+        
+        # Get multi-view settings from config
+        use_multi_view = getattr(cfg.model, 'use_multi_view', False)
+        image_views = list(getattr(cfg.model, 'image_views', ['primary', 'secondary', 'wrist']))
         
         # Training dataset
         train_dataset = RobotRLDSDataset(
@@ -157,6 +171,8 @@ class OpenVLAWorkspace:
             augment_crop_ratio=cfg.training.augment_crop_ratio,
             val_split=cfg.training.val_split,
             seed=cfg.training.seed,
+            use_multi_view=use_multi_view,
+            image_views=image_views,
         )
         
         # Validation dataset
@@ -168,6 +184,8 @@ class OpenVLAWorkspace:
             augment_crop_ratio=cfg.training.augment_crop_ratio,
             val_split=cfg.training.val_split,
             seed=cfg.training.seed,
+            use_multi_view=use_multi_view,
+            image_views=image_views,
         )
         
         # Setup action statistics for denormalization
@@ -279,21 +297,36 @@ class OpenVLAWorkspace:
                 "trainable_parameters": sum(p.numel() for p in self.model.parameters() if p.requires_grad),
             }, allow_val_change=True)
         
-        # Debug: Print sample instructions from dataset to verify format
+        # Debug: Print sample data from dataset to verify format and multi-view
         if self.is_main_process and cfg.training.debug:
             print("\n" + "=" * 60)
-            print("DEBUG: Verifying instruction format in training data")
+            print("DEBUG: Verifying dataset format and multi-view images")
             print("=" * 60)
-            # Sample directly from dataset (faster than iterating dataloader)
+            
+            # Sample directly from dataset
             dataset = self.train_dataloader.dataset
+            sample = dataset[0]
+            
+            # Check multi-view
+            use_multi_view = getattr(cfg.model, 'use_multi_view', False)
+            print(f"Multi-view enabled: {use_multi_view}")
+            
+            if isinstance(sample['image'], dict):
+                print(f"Multi-view images in dataset:")
+                for view_name, view_tensor in sample['image'].items():
+                    print(f"  - {view_name}: shape={view_tensor.shape}")
+            else:
+                print(f"Single image: shape={sample['image'].shape}")
+            
+            # Sample instructions
             sample_indices = [0, len(dataset)//4, len(dataset)//2, len(dataset)*3//4, len(dataset)-1]
             sample_instructions = set()
             for idx in sample_indices:
                 if idx < len(dataset):
-                    sample = dataset[idx]
-                    sample_instructions.add(sample['instruction'])
+                    s = dataset[idx]
+                    sample_instructions.add(s['instruction'])
             
-            print(f"Sample instructions found in dataset ({len(dataset)} total samples):")
+            print(f"\nSample instructions ({len(dataset)} total samples):")
             for inst in list(sample_instructions)[:5]:
                 full_prompt = f"In: What action should the robot take to {inst}?\nOut:"
                 print(f"  - Instruction: '{inst}'")
@@ -302,6 +335,9 @@ class OpenVLAWorkspace:
         
         # Training loop
         early_stopped = False
+        # Initialize train_metrics in case training loop doesn't execute
+        train_metrics = {'train_loss': self.best_loss, 'train_loss_std': 0.0, 'train_loss_min': 0.0, 'train_loss_max': 0.0}
+        
         for epoch in range(self.epoch, cfg.training.num_epochs):
             self.epoch = epoch
             
@@ -447,22 +483,61 @@ class OpenVLAWorkspace:
         for batch_idx, batch in enumerate(pbar):
             # Move to device (use model's device for correct GPU in distributed training)
             device = self.model.device
-            images = batch['image'].to(device)
+            
+            # Handle multi-view images (dict) or single image (tensor)
+            images = batch['image']
+            if isinstance(images, dict):
+                images = {k: v.to(device) for k, v in images.items()}
+            else:
+                images = images.to(device)
+            
             actions = batch['action'].to(device)
             instructions = batch['instruction']
             
-            # Debug: Print instruction info on first batch of first epoch
-            if self.is_main_process and cfg.training.debug and self.epoch == 0 and batch_idx == 0:
-                print(f"\n[DEBUG] First training batch instructions (epoch {self.epoch}, batch {batch_idx}):")
-                for i, inst in enumerate(instructions[:3]):  # Show first 3
-                    full_prompt = f"In: What action should the robot take to {inst}?\nOut:"
-                    print(f"  [{i}] Instruction: '{inst}'")
-                    print(f"      Full prompt: '{full_prompt}'")
-                print(f"  ... (batch size: {len(instructions)})\n")
+            # Debug: Print multi-view and instruction info on first batch of first epoch
+            debug_this_batch = self.is_main_process and cfg.training.debug and self.epoch == 0 and batch_idx == 0
             
-            # Forward pass
-            outputs = self.model(images, instructions, actions)
+            if debug_this_batch:
+                print(f"\n" + "=" * 60)
+                print(f"[DEBUG] First training batch (epoch {self.epoch}, batch {batch_idx})")
+                print("=" * 60)
+                
+                # Show image info
+                if isinstance(images, dict):
+                    print(f"Multi-view images detected! {len(images)} views:")
+                    for view_name, view_tensor in images.items():
+                        print(f"  - {view_name}: shape={view_tensor.shape}, device={view_tensor.device}")
+                else:
+                    print(f"Single image: shape={images.shape}, device={images.device}")
+                
+                # Show instruction info
+                print(f"\nInstructions (first 3 of {len(instructions)}):")
+                for i, inst in enumerate(instructions[:3]):
+                    full_prompt = f"In: What action should the robot take to {inst}?\nOut:"
+                    print(f"  [{i}] '{inst}'")
+                print("=" * 60 + "\n")
+            
+            # Forward pass (model handles multi-view fusion internally)
+            # Request image tensors for logging on first batch
+            should_log_images = (
+                self.is_main_process and 
+                cfg.logging.mode == "online" and
+                batch_idx == 0 and 
+                self.epoch % getattr(cfg.logging, 'log_images_every_n_epochs', 1) == 0
+            )
+            
+            outputs = self.model(
+                images, 
+                instructions, 
+                actions, 
+                debug=debug_this_batch,
+                return_image_tensors=should_log_images
+            )
             loss = outputs['loss']
+            
+            # Log images to wandb if requested
+            if should_log_images and 'image_tensors' in outputs:
+                self._log_images_to_wandb(outputs['image_tensors'], outputs.get('view_names', []), instructions[:3])
             
             # Backward pass
             loss = loss / cfg.training.gradient_accumulate_every
@@ -511,8 +586,8 @@ class OpenVLAWorkspace:
             if self.is_main_process:
                 pbar.set_postfix({'loss': current_loss})
             
-            # Early exit for debugging
-            if cfg.training.debug and batch_idx >= cfg.training.max_train_steps:
+            # Early exit for debugging (if max_train_steps is set)
+            if cfg.training.debug and cfg.training.max_train_steps is not None and batch_idx >= cfg.training.max_train_steps:
                 break
         
         avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
@@ -535,6 +610,67 @@ class OpenVLAWorkspace:
                 param_norm = p.grad.data.norm(2)
                 total_norm += param_norm.item() ** 2
         return total_norm ** 0.5
+    
+    def _log_images_to_wandb(
+        self, 
+        image_tensors: Dict[str, torch.Tensor], 
+        view_names: List[str],
+        instructions: List[str]
+    ):
+        """
+        Log input images to wandb for visualization.
+        
+        Args:
+            image_tensors: Dict of {view_name: (B, C, H, W)} image tensors
+            view_names: List of view names in order
+            instructions: List of instructions for context
+        """
+        try:
+            import wandb
+            
+            # Prepare images for logging
+            wandb_images = []
+            
+            # Log up to 3 samples from the batch
+            num_samples = min(3, next(iter(image_tensors.values())).shape[0])
+            
+            for sample_idx in range(num_samples):
+                # Get instruction for this sample
+                instruction = instructions[sample_idx] if sample_idx < len(instructions) else "N/A"
+                
+                # Create a row of images for all views
+                view_images = []
+                for view_name in view_names:
+                    if view_name in image_tensors:
+                        img_tensor = image_tensors[view_name][sample_idx]  # (C, H, W)
+                        # Convert to numpy: (H, W, C)
+                        img_np = img_tensor.permute(1, 2, 0).cpu().numpy()
+                        # Clip to [0, 1] and convert to uint8
+                        img_np = np.clip(img_np, 0, 1)
+                        img_np = (img_np * 255).astype(np.uint8)
+                        view_images.append(img_np)
+                
+                # Concatenate views horizontally
+                if len(view_images) > 1:
+                    combined_img = np.concatenate(view_images, axis=1)
+                else:
+                    combined_img = view_images[0]
+                
+                # Create caption with view names and instruction
+                caption = f"Views: {', '.join(view_names)} | Instruction: {instruction}"
+                
+                wandb_images.append(wandb.Image(combined_img, caption=caption))
+            
+            # Log to wandb
+            wandb.log({
+                "train/input_images": wandb_images,
+                "epoch": self.epoch,
+            }, step=self.global_step)
+            
+            print(f"[INFO] Logged {len(wandb_images)} multi-view image samples to wandb")
+            
+        except Exception as e:
+            print(f"[WARNING] Failed to log images to wandb: {e}")
     
     def _get_env_action_dim(self, env) -> int:
         """Get the expected action dimension from an environment.
@@ -1005,8 +1141,8 @@ class OpenVLAWorkspace:
             total_loss += loss.item()
             num_batches += 1
             
-            # Early exit for debugging
-            if cfg.training.debug and batch_idx >= cfg.training.max_val_steps:
+            # Early exit for debugging (if max_val_steps is set)
+            if cfg.training.debug and cfg.training.max_val_steps is not None and batch_idx >= cfg.training.max_val_steps:
                 break
         
         avg_loss = total_loss / num_batches if num_batches > 0 else 0.0

@@ -19,6 +19,11 @@ model:
   torch_dtype: "bfloat16"
   image_size: 224
   action_dim: 8
+  # Multi-view configuration (3 camera views)
+  use_multi_view: True
+  num_images: 3
+  image_views: ["primary", "secondary", "wrist"]  # head_cam, global_cam, wrist_cam
+  multi_view_fusion: "concatenate"  # 'concatenate' horizontally then resize
 
 # Training configuration
 training:
@@ -60,7 +65,7 @@ training:
   eval_sim_max_steps: 200             # Longer episodes
   
   # Debug mode (disabled for production)
-  debug: False
+  debug: True
   max_train_steps: null
   max_val_steps: null
 
@@ -89,6 +94,7 @@ logging:
   log_gradients: True                 # Log gradient norms
   log_learning_rate: True             # Log learning rate
   log_images: True                    # Log sample observations
+  log_images_every_n_epochs: 1        # Log input images every N epochs (multi-view visualization)
   log_action_predictions: True        # Log predicted vs GT actions
   log_eval_video: False               # Log evaluation rollout videos
 
