@@ -63,7 +63,7 @@ outputs/
 
 # Slurm server files
 interactive.sh
-train.sh
+sbatch_*.sh
 sbatch.sh
 sbatch_openvla.sh
 sbatch_evaluation.sh
