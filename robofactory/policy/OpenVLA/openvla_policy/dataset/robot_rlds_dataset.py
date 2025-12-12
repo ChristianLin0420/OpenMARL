@@ -18,7 +18,7 @@ class RobotRLDSDataset(BaseVLADataset):
     
     Supports loading multiple camera views:
     - primary: head/side camera (third-person view)
-    - secondary: global camera (overhead view)  
+    - secondary: global camera (overhead view) - loaded from separate global folder
     - wrist: wrist/gripper camera (end-effector view)
     """
     
@@ -33,12 +33,14 @@ class RobotRLDSDataset(BaseVLADataset):
         seed: int = 42,
         use_multi_view: bool = False,
         image_views: List[str] = None,  # ['primary', 'secondary', 'wrist']
+        global_data_dir: Optional[str] = None,  # Path to global camera RLDS data
+        auto_detect_global: bool = True,  # Auto-detect global folder from agent path
     ):
         """
         Initialize RLDS dataset with multi-view support.
         
         Args:
-            data_dir: Directory containing RLDS dataset
+            data_dir: Directory containing RLDS dataset (agent-specific)
             train: Whether to load training or validation split
             image_size: Target image size (H, W)
             augment: Whether to apply image augmentation
@@ -47,6 +49,9 @@ class RobotRLDSDataset(BaseVLADataset):
             seed: Random seed for split
             use_multi_view: Whether to load multiple camera views
             image_views: List of view names to load ['primary', 'secondary', 'wrist']
+            global_data_dir: Optional path to global camera RLDS data folder
+            auto_detect_global: If True, auto-detect global folder from agent path
+                               (e.g., LiftBarrier-rf_Agent0 -> LiftBarrier-rf_global)
         """
         super().__init__()
         
@@ -60,6 +65,15 @@ class RobotRLDSDataset(BaseVLADataset):
         self.use_multi_view = use_multi_view
         self.image_views = image_views or ['primary', 'secondary', 'wrist']
         
+        # Handle global data directory
+        self.global_data_dir = None
+        if global_data_dir:
+            self.global_data_dir = Path(global_data_dir)
+        elif auto_detect_global and use_multi_view and 'secondary' in self.image_views:
+            # Auto-detect global folder from agent path
+            # e.g., data/rlds_data/LiftBarrier-rf_Agent0 -> data/rlds_data/LiftBarrier-rf_global
+            self.global_data_dir = self._auto_detect_global_dir()
+        
         # Map view names to TFRecord keys
         self.view_to_key = {
             'primary': 'observation/side_image',      # Head camera (side view)
@@ -71,11 +85,36 @@ class RobotRLDSDataset(BaseVLADataset):
         self.info = self._load_dataset_info()
         self.statistics = self._load_statistics()
         self.episodes = self._load_episodes()
+        
+        # Load and merge global images if available
+        if self.global_data_dir and self.global_data_dir.exists():
+            self._load_and_merge_global_images()
+        
         self.indices = self._create_split()
         
         print(f"Loaded {len(self.indices)} samples ({'train' if train else 'val'})")
         if self.use_multi_view:
             print(f"  Multi-view enabled: {self.image_views}")
+            if self.global_data_dir:
+                print(f"  Global camera data: {self.global_data_dir}")
+    
+    def _auto_detect_global_dir(self) -> Optional[Path]:
+        """Auto-detect global data directory from agent path."""
+        # Parse agent path: e.g., LiftBarrier-rf_Agent0 or LiftBarrier-rf_Agent0_160
+        dir_name = self.data_dir.name
+        
+        # Extract task name (everything before _Agent)
+        if '_Agent' in dir_name:
+            task_name = dir_name.split('_Agent')[0]
+            global_dir = self.data_dir.parent / f"{task_name}_global"
+            
+            if global_dir.exists():
+                print(f"Auto-detected global data directory: {global_dir}")
+                return global_dir
+            else:
+                print(f"Warning: Global data directory not found at {global_dir}")
+        
+        return None
     
     def _load_dataset_info(self) -> Dict:
         """Load dataset info from JSON file."""
@@ -141,7 +180,7 @@ class RobotRLDSDataset(BaseVLADataset):
             if side_bytes:
                 images['primary'] = tf.io.decode_png(side_bytes).numpy()
             
-            # Secondary: global camera
+            # Secondary: global camera (may be empty in agent data, will be filled from global folder)
             global_bytes = example['observation/global_image'].numpy()
             if global_bytes:
                 images['secondary'] = tf.io.decode_png(global_bytes).numpy()
@@ -174,11 +213,87 @@ class RobotRLDSDataset(BaseVLADataset):
         # Log available views from first episode
         if episodes and episodes[0]:
             available_views = list(episodes[0][0]['images'].keys())
-            print(f"Available camera views in dataset: {available_views}")
+            print(f"Available camera views in agent dataset: {available_views}")
         
         print(f"Loaded {len(episodes)} episodes from {tfrecord_path}")
         return episodes
     
+    def _load_and_merge_global_images(self):
+        """Load global camera images from separate folder and merge with agent data."""
+        global_tfrecord = self.global_data_dir / 'train.tfrecord'
+        
+        if not global_tfrecord.exists():
+            print(f"Warning: Global TFRecord not found at {global_tfrecord}")
+            return
+        
+        print(f"Loading global camera images from {global_tfrecord}...")
+        
+        # Feature description for global data (no actions)
+        global_keys = {
+            'is_first': tf.io.FixedLenFeature([], tf.int64),
+            'is_last': tf.io.FixedLenFeature([], tf.int64),
+            'is_terminal': tf.io.FixedLenFeature([], tf.int64),
+            'language_instruction': tf.io.FixedLenFeature([], tf.string),
+            'observation/image': tf.io.FixedLenFeature([], tf.string, default_value=b''),
+            'observation/global_image': tf.io.FixedLenFeature([], tf.string, default_value=b''),
+        }
+        
+        global_dataset = tf.data.TFRecordDataset(str(global_tfrecord))
+        
+        # Load global images organized by episode/step
+        global_episodes = []
+        current_global_episode = []
+        
+        for raw_record in global_dataset:
+            example = tf.io.parse_single_example(raw_record, global_keys)
+            
+            # Try global_image first, then fallback to image
+            global_bytes = example['observation/global_image'].numpy()
+            if not global_bytes:
+                global_bytes = example['observation/image'].numpy()
+            
+            global_image = None
+            if global_bytes:
+                global_image = tf.io.decode_png(global_bytes).numpy()
+            
+            step = {
+                'global_image': global_image,
+                'is_first': bool(example['is_first'].numpy()),
+                'is_last': bool(example['is_last'].numpy()),
+            }
+            
+            current_global_episode.append(step)
+            
+            if step['is_last']:
+                global_episodes.append(current_global_episode)
+                current_global_episode = []
+        
+        print(f"Loaded {len(global_episodes)} global episodes")
+        
+        # Merge global images into agent episodes
+        merged_count = 0
+        mismatch_episodes = 0
+        
+        for ep_idx, (agent_ep, global_ep) in enumerate(zip(self.episodes, global_episodes)):
+            if len(agent_ep) != len(global_ep):
+                print(f"Warning: Episode {ep_idx} length mismatch - agent: {len(agent_ep)}, global: {len(global_ep)}")
+                mismatch_episodes += 1
+                continue
+            
+            for step_idx, (agent_step, global_step) in enumerate(zip(agent_ep, global_ep)):
+                if global_step['global_image'] is not None:
+                    agent_step['images']['secondary'] = global_step['global_image']
+                    merged_count += 1
+        
+        print(f"Merged {merged_count} global images into agent data")
+        if mismatch_episodes > 0:
+            print(f"Warning: {mismatch_episodes} episodes had length mismatches")
+        
+        # Verify merge
+        if self.episodes and self.episodes[0]:
+            available_views = list(self.episodes[0][0]['images'].keys())
+            print(f"Available camera views after merge: {available_views}")
+
     def _create_split(self):
         """Create train/val split indices."""
         all_indices = []

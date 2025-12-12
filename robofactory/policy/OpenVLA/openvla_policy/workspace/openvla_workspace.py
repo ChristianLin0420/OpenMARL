@@ -285,7 +285,7 @@ class OpenVLAWorkspace:
             # Resume wandb run if we have a saved run ID
             if self.wandb_run_id is not None:
                 wandb_kwargs["id"] = self.wandb_run_id
-                wandb_kwargs["resume"] = "must"
+                wandb_kwargs["resume"] = "allow"  # Use "allow" not "must"
                 print(f"Resuming wandb run: {self.wandb_run_id}")
             
             wandb.init(**wandb_kwargs)

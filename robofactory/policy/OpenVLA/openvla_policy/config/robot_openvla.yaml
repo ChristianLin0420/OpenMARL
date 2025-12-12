@@ -71,20 +71,20 @@ training:
 
 # Dataloader configuration
 dataloader:
-  batch_size: 32
+  batch_size: 8
   num_workers: 8
   shuffle: True
   pin_memory: True
 
 val_dataloader:
-  batch_size: 32
+  batch_size: 8
   num_workers: 8
   shuffle: False
   pin_memory: True
 
 # Logging configuration
 logging:
-  project: "openmarl"
+  project: "test_log"
   mode: "online"
   name: "${task_name}_${exp_name}_Agent${agent_id}"
   tags: ["${name}", "${task_name}", "${exp_name}", "Agent${agent_id}"]
