@@ -1130,7 +1130,14 @@ class OpenVLAWorkspace:
         for batch_idx, batch in enumerate(pbar):
             # Move to device (use model's device for correct GPU in distributed training)
             device = self.model.device
-            images = batch['image'].to(device)
+            
+            # Handle multi-view images (dict) or single image (tensor)
+            images = batch['image']
+            if isinstance(images, dict):
+                images = {k: v.to(device) for k, v in images.items()}
+            else:
+                images = images.to(device)
+            
             actions = batch['action'].to(device)
             instructions = batch['instruction']
             

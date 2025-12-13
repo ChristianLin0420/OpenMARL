@@ -71,13 +71,13 @@ training:
 
 # Dataloader configuration
 dataloader:
-  batch_size: 8
+  batch_size: 12
   num_workers: 8
   shuffle: True
   pin_memory: True
 
 val_dataloader:
-  batch_size: 8
+  batch_size: 12
   num_workers: 8
   shuffle: False
   pin_memory: True
