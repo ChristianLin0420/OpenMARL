@@ -71,13 +71,13 @@ training:
 
 # Dataloader configuration
 dataloader:
-  batch_size: 12
+  batch_size: 8
   num_workers: 8
   shuffle: True
   pin_memory: True
 
 val_dataloader:
-  batch_size: 12
+  batch_size: 8
   num_workers: 8
   shuffle: False
   pin_memory: True
@@ -103,7 +103,7 @@ hydra:
   job:
     override_dirname: ${name}
   run:
-    dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
+    dir: robofactory/checkpoints/openvla/${task.name}_Agent${agent_id}
   sweep:
     dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
     subdir: ${hydra.job.num}

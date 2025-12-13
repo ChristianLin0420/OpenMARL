@@ -266,7 +266,8 @@ class OpenVLAWorkspace:
         
         # Resume from checkpoint if exists
         if cfg.training.resume:
-            checkpoint_path = self.output_dir / 'checkpoints' / 'latest.ckpt'
+            checkpoint_dir = Path('robofactory/checkpoints/openvla') / Path(cfg.task.dataset.rlds_path).stem
+            checkpoint_path = checkpoint_dir / 'latest.ckpt'
             if checkpoint_path.exists():
                 if self.is_main_process:
                     print(f"Resuming from {checkpoint_path}")
@@ -1160,7 +1161,7 @@ class OpenVLAWorkspace:
         if not self.is_main_process:
             return
         
-        checkpoint_dir = self.output_dir / 'checkpoints' / Path(self.cfg.task.dataset.rlds_path).stem
+        checkpoint_dir = Path('robofactory/checkpoints/openvla') / Path(self.cfg.task.dataset.rlds_path).stem
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
         
         if name is None:
@@ -1188,7 +1189,7 @@ class OpenVLAWorkspace:
         torch.save(state, checkpoint_path)
         
         # Also save as latest
-        latest_path = checkpoint_dir.parent / 'latest.ckpt'
+        latest_path = checkpoint_dir / 'latest.ckpt'
         torch.save(state, latest_path)
         
         # Save a JSON metadata file for easy inspection
@@ -1199,7 +1200,7 @@ class OpenVLAWorkspace:
             'wandb_run_id': self.wandb_run_id,
             'checkpoint_path': str(checkpoint_path),
         }
-        metadata_path = checkpoint_dir.parent / 'training_state.json'
+        metadata_path = checkpoint_dir / 'training_state.json'
         with open(metadata_path, 'w') as f:
             json.dump(metadata, f, indent=2)
         
