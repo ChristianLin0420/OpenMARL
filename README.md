@@ -109,6 +109,65 @@ sudo apt install libgl1 libglvnd0 libegl1-mesa libgles2-mesa libopengl0
 
 ---
 
+## 📦 Data Preparation
+
+### Option 1: Automated Data Preparation (Recommended)
+
+We provide an automated script that handles all data generation and processing steps for all tasks:
+
+```bash
+cd robofactory
+hf auth login # Robocasa required huggingface token to access
+bash prepare_all_data.sh
+```
+
+This script will:
+1. Download required assets
+2. Generate demonstration data for all tasks (150 episodes each)
+3. Convert data from H5 → PKL → ZARR format automatically
+4. Skip already prepared tasks to save time
+
+The script processes both `table` and `robocasa` scene types for all available tasks.
+
+**Note:** The data preparation process can take several hours depending on your hardware.
+
+### Option 2: Manual Data Generation (For Individual Tasks)
+
+If you want to generate data for a specific task:
+
+```bash
+# Format: python script/generate_data.py --config {config_path} --num {traj_num} [--save-video]
+python script/generate_data.py --config configs/table/lift_barrier.yaml --num 150 --save-video
+```
+
+The generated demonstration data will be saved in the `demos/` folder.
+
+### Data Processing
+
+If you generated data manually, you need to convert it to the appropriate format:
+
+```bash
+# 1. Create data directories (first time only)
+mkdir -p data/{h5_data,pkl_data,zarr_data,rlds_data}
+
+# 2. Move your H5 and JSON files to data/h5_data/
+mv demos/{task_name}/motionplanning/*.h5 data/h5_data/{task_name}.h5
+mv demos/{task_name}/motionplanning/*.json data/h5_data/{task_name}.json
+
+# 3. Convert H5 → PKL (handles both single and multi-agent tasks)
+python script/parse_h5_to_pkl_multi.py --task_name LiftBarrier-rf --load_num 150 --agent_num 2
+
+# 4. Convert PKL → ZARR (for Diffusion Policy, for each agent)
+python script/parse_pkl_to_zarr_dp.py --task_name LiftBarrier-rf --load_num 150 --agent_id 0
+python script/parse_pkl_to_zarr_dp.py --task_name LiftBarrier-rf --load_num 150 --agent_id 1
+
+# 5. (For OpenVLA) Convert ZARR → RLDS
+python policy/OpenVLA/openvla_policy/utils/data_conversion.py \
+    --zarr_path data/zarr_data --output_dir data/rlds_data --batch
+```
+
+---
+
 ## 🎯 Unified Training Interface
 
 **Single command to train any policy:**
@@ -178,69 +237,11 @@ bash eval.sh --help
 
 ---
 
-## 📦 Data Preparation
-
-### Option 1: Automated Data Preparation (Recommended)
-
-We provide an automated script that handles all data generation and processing steps for all tasks:
-
-```bash
-cd robofactory
-bash prepare_all_data.sh
-```
-
-This script will:
-1. Download required assets
-2. Generate demonstration data for all tasks (150 episodes each)
-3. Convert data from H5 → PKL → ZARR format automatically
-4. Skip already prepared tasks to save time
-
-The script processes both `table` and `robocasa` scene types for all available tasks.
-
-**Note:** The data preparation process can take several hours depending on your hardware.
-
-### Option 2: Manual Data Generation (For Individual Tasks)
-
-If you want to generate data for a specific task:
-
-```bash
-# Format: python script/generate_data.py --config {config_path} --num {traj_num} [--save-video]
-python script/generate_data.py --config configs/table/lift_barrier.yaml --num 150 --save-video
-```
-
-The generated demonstration data will be saved in the `demos/` folder.
-
-### Data Processing
-
-If you generated data manually, you need to convert it to the appropriate format:
-
-```bash
-# 1. Create data directories (first time only)
-mkdir -p data/{h5_data,pkl_data,zarr_data,rlds_data}
-
-# 2. Move your H5 and JSON files to data/h5_data/
-mv demos/{task_name}/motionplanning/*.h5 data/h5_data/{task_name}.h5
-mv demos/{task_name}/motionplanning/*.json data/h5_data/{task_name}.json
-
-# 3. Convert H5 → PKL (handles both single and multi-agent tasks)
-python script/parse_h5_to_pkl_multi.py --task_name LiftBarrier-rf --load_num 150 --agent_num 2
-
-# 4. Convert PKL → ZARR (for Diffusion Policy, for each agent)
-python script/parse_pkl_to_zarr_dp.py --task_name LiftBarrier-rf --load_num 150 --agent_id 0
-python script/parse_pkl_to_zarr_dp.py --task_name LiftBarrier-rf --load_num 150 --agent_id 1
-
-# 5. (For OpenVLA) Convert ZARR → RLDS
-python policy/OpenVLA/openvla_policy/utils/data_conversion.py \
-    --zarr_path data/zarr_data --output_dir data/rlds_data --batch
-```
-
----
-
 ## 🤖 Supported Policies
 
 | Policy | Type | Data Format | Multi-GPU | Documentation |
 |--------|------|-------------|-----------|---------------|
-| **Diffusion Policy** | CNN-based diffusion | ZARR | ❌ Single GPU | [📖 README](robofactory/policy/Diffusion-Policy/README.md) |
+| **Diffusion Policy** | CNN-based diffusion | ZARR | ✅ Multi-GPU | [📖 README](robofactory/policy/Diffusion-Policy/README.md) |
 | **OpenVLA** | Vision-Language-Action | RLDS | ✅ Multi-GPU | [📖 README](robofactory/policy/OpenVLA/README.md) |
 
 ### Policy-Specific Documentation
