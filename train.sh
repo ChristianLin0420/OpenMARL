@@ -199,7 +199,11 @@ train_openvla() {
         return 1
     fi
     
-    local batch_size=${BATCH_SIZE:-32}
+    # Build batch_size argument only if explicitly provided
+    local batch_size_arg=""
+    if [[ -n "$BATCH_SIZE" ]]; then
+        batch_size_arg="dataloader.batch_size=${BATCH_SIZE}"
+    fi
     
     if [[ "$GPUS" -gt 1 ]]; then
         # Multi-GPU training with torchrun
@@ -212,8 +216,8 @@ train_openvla() {
             agent_id=${agent_id} \
             training.seed=${SEED} \
             training.debug=${DEBUG} \
-            dataloader.batch_size=${batch_size} \
-            logging.mode=${WANDB_MODE}
+            logging.mode=${WANDB_MODE} \
+            ${batch_size_arg}
     else
         # Single GPU training
         export CUDA_VISIBLE_DEVICES=0
@@ -224,8 +228,8 @@ train_openvla() {
             agent_id=${agent_id} \
             training.seed=${SEED} \
             training.debug=${DEBUG} \
-            dataloader.batch_size=${batch_size} \
-            logging.mode=${WANDB_MODE}
+            logging.mode=${WANDB_MODE} \
+            ${batch_size_arg}
     fi
 }
 

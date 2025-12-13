@@ -29,7 +29,7 @@ model:
 training:
   device: "cuda:0"
   seed: 42
-  num_epochs: 50
+  num_epochs: 30
   learning_rate: 5.0e-4
   min_learning_rate: 1.0e-6
   weight_decay: 1.0e-6
@@ -84,13 +84,13 @@ val_dataloader:
 
 # Logging configuration
 logging:
-  project: "test_log"
+  project: "openmarl"
   mode: "online"
   name: "${task_name}_${exp_name}_Agent${agent_id}"
   tags: ["${name}", "${task_name}", "${exp_name}", "Agent${agent_id}"]
   
   # Step-level logging
-  log_every_n_steps: 50               # Log to wandb every N steps
+  log_every_n_steps: 20               # Log to wandb every N steps
   log_gradients: True                 # Log gradient norms
   log_learning_rate: True             # Log learning rate
   log_images: True                    # Log sample observations
