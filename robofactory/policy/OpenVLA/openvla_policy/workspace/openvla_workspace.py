@@ -388,13 +388,21 @@ class OpenVLAWorkspace:
                             print(f"Early stopping triggered! No improvement for {patience} epochs.")
                         early_stopped = True
             
-            # Update best loss and save best checkpoint
+            # Synchronize loss across all ranks so all make the same checkpoint decision
+            # This prevents NCCL deadlock from conditional barriers
+            if self.is_distributed:
+                loss_tensor = torch.tensor([current_loss], device=self.model.device)
+                dist.all_reduce(loss_tensor, op=dist.ReduceOp.AVG)
+                current_loss = loss_tensor.item()
+            
+            # Update best loss and save best checkpoint (all ranks now have same loss value)
             if current_loss < self.best_loss:
                 self.best_loss = current_loss
                 if self.is_main_process:
                     self.save_checkpoint(name='best.ckpt')
-                if self.is_distributed:
-                    dist.barrier()
+            # Barrier OUTSIDE conditional - all ranks must reach this
+            if self.is_distributed:
+                dist.barrier()
             
             # Simulation evaluation (optimized with GPU backend + parallel envs)
             if hasattr(cfg.training, 'eval_in_sim') and cfg.training.eval_in_sim:
@@ -412,8 +420,9 @@ class OpenVLAWorkspace:
             if (epoch + 1) % cfg.training.checkpoint_every == 0:
                 if self.is_main_process:
                     self.save_checkpoint()
-                if self.is_distributed:
-                    dist.barrier()
+            # Barrier OUTSIDE conditional - ensures all ranks sync after checkpoint epochs
+            if self.is_distributed:
+                dist.barrier()
             
             # Update scheduler
             if self.scheduler is not None:
