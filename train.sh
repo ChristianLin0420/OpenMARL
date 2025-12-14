@@ -46,7 +46,7 @@ show_help() {
     echo "Usage: bash train.sh --policy <policy> --task <task> --agent_id <id> [options]"
     echo ""
     echo "Required Arguments:"
-    echo "  --policy        Policy type: 'dp' (Diffusion Policy) or 'openvla'"
+    echo "  --policy        Policy type: 'dp' (Diffusion Policy), 'openvla', 'pi0', or 'pi05'"
     echo "  --task          Task name (e.g., LiftBarrier-rf, CameraAlignment-rf)"
     echo "  --agent_id      Agent ID (0, 1, 2, ...) or use --all_agents"
     echo ""
@@ -63,6 +63,8 @@ show_help() {
     echo "Supported Policies:"
     echo "  dp       - Diffusion Policy (CNN-based, ZARR data)"
     echo "  openvla  - OpenVLA (Vision-Language-Action, RLDS data)"
+    echo "  pi0      - Pi-0 (Flow-based VLA, LeRobot data)"
+    echo "  pi05     - Pi-0.5 (Flow-based VLA, LeRobot data)"
     echo ""
     echo "Examples:"
     echo "  # Single GPU Diffusion Policy"
@@ -73,6 +75,9 @@ show_help() {
     echo ""
     echo "  # Train all agents"
     echo "  bash train.sh --policy dp --task LiftBarrier-rf --all_agents"
+    echo ""
+    echo "  # Train Pi-0 model"
+    echo "  bash train.sh --policy pi0 --task LiftBarrier-rf --agent_id 0 --gpus 4"
     exit 0
 }
 
@@ -110,8 +115,8 @@ if [[ "$ALL_AGENTS" == false && -z "$AGENT_ID" ]]; then
 fi
 
 # Validate policy
-if [[ "$POLICY" != "dp" && "$POLICY" != "openvla" ]]; then
-    echo -e "${RED}Error: Invalid policy '$POLICY'. Use 'dp' or 'openvla'${NC}"
+if [[ "$POLICY" != "dp" && "$POLICY" != "openvla" && "$POLICY" != "pi0" && "$POLICY" != "pi05" ]]; then
+    echo -e "${RED}Error: Invalid policy '$POLICY'. Use 'dp', 'openvla', 'pi0', or 'pi05'${NC}"
     exit 1
 fi
 
@@ -233,6 +238,58 @@ train_openvla() {
     fi
 }
 
+train_pi0() {
+    local agent_id="$1"
+    local model_type="${POLICY}"  # pi0 or pi05
+    
+    echo -e "${BLUE}Training Pi-${model_type#pi} (Physical Intelligence VLA)${NC}"
+    echo -e "  Task: ${TASK}, Agent: ${agent_id}, Seed: ${SEED}, GPUs: ${GPUS}"
+    
+    local lerobot_path="robofactory/data/lerobot_data/${TASK}_Agent${agent_id}_${DATA_NUM}"
+    
+    if [[ ! -d "$lerobot_path" ]]; then
+        echo -e "${RED}Error: LeRobot dataset not found at ${lerobot_path}${NC}"
+        echo -e "${YELLOW}Run data preparation first: cd robofactory && bash prepare_all_data.sh${NC}"
+        return 1
+    fi
+    
+    # Build batch_size argument only if explicitly provided
+    local batch_size_arg=""
+    if [[ -n "$BATCH_SIZE" ]]; then
+        batch_size_arg="dataloader.batch_size=${BATCH_SIZE}"
+    fi
+    
+    # Determine config name based on model type
+    local config_name="robot_${model_type}"
+    
+    if [[ "$GPUS" -gt 1 ]]; then
+        # Multi-GPU training with torchrun (DDP)
+        echo -e "${GREEN}Using multi-GPU training with ${GPUS} GPUs (DistributedDataParallel)${NC}"
+        torchrun --standalone --nnodes=1 --nproc-per-node=${GPUS} \
+            robofactory/policy/Pi0/train.py \
+            --config-name=${config_name}.yaml \
+            task.name=${TASK} \
+            +task.lerobot_path=${lerobot_path} \
+            agent_id=${agent_id} \
+            training.seed=${SEED} \
+            +training.debug=${DEBUG} \
+            logging.mode=${WANDB_MODE} \
+            ${batch_size_arg}
+    else
+        # Single GPU training
+        export CUDA_VISIBLE_DEVICES=0
+        python robofactory/policy/Pi0/train.py \
+            --config-name=${config_name}.yaml \
+            task.name=${TASK} \
+            +task.lerobot_path=${lerobot_path} \
+            agent_id=${agent_id} \
+            training.seed=${SEED} \
+            +training.debug=${DEBUG} \
+            logging.mode=${WANDB_MODE} \
+            ${batch_size_arg}
+    fi
+}
+
 #==============================================================================
 # Get number of agents for a task
 #==============================================================================
@@ -270,6 +327,7 @@ train_agent() {
     case "$POLICY" in
         dp)      train_diffusion_policy "$agent_id" ;;
         openvla) train_openvla "$agent_id" ;;
+        pi0|pi05) train_pi0 "$agent_id" ;;
     esac
 }
 

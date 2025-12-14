@@ -278,6 +278,31 @@ has_rlds_data() {
     return 0
 }
 
+# Check if LeRobot data exists for a specific agent
+has_lerobot_data_agent() {
+    local task_name="$1"
+    local agent_id="$2"
+    local lerobot_path="data/lerobot_data/${task_name}_Agent${agent_id}_${NUM_EPISODES}"
+    
+    if [ -d "$lerobot_path" ]; then
+        return 0
+    fi
+    return 1
+}
+
+# Check if LeRobot data exists for all agents
+has_lerobot_data() {
+    local task_name="$1"
+    local agent_count="$2"
+    
+    for ((i=0; i<agent_count; i++)); do
+        if ! has_lerobot_data_agent "$task_name" "$i"; then
+            return 1
+        fi
+    done
+    return 0
+}
+
 #==============================================================================
 # Prepare data for a single task (with step-level skipping)
 #==============================================================================
@@ -298,9 +323,9 @@ prepare_task_data() {
     
     log "  Found $agent_count agents for this task"
     
-    # Check if fully prepared (all RLDS data exists)
-    if has_rlds_data "$task_name" "$agent_count"; then
-        log "${GREEN}✓ Task $task_name is fully prepared (all RLDS data exists), skipping...${NC}"
+    # Check if fully prepared (all RLDS and LeRobot data exists)
+    if has_rlds_data "$task_name" "$agent_count" && has_lerobot_data "$task_name" "$agent_count"; then
+        log "${GREEN}✓ Task $task_name is fully prepared (all RLDS and LeRobot data exists), skipping...${NC}"
         return 0
     fi
     
@@ -310,10 +335,10 @@ prepare_task_data() {
     # Step 1 & 2: Generate raw data and move h5 files
     #--------------------------------------------------------------------------
     if has_h5_data "$task_name"; then
-        log "  Step 1/5: ${GREEN}[SKIP]${NC} H5 data already exists"
-        log "  Step 2/5: ${GREEN}[SKIP]${NC} H5 files already in data/h5_data/"
+        log "  Step 1/6: ${GREEN}[SKIP]${NC} H5 data already exists"
+        log "  Step 2/6: ${GREEN}[SKIP]${NC} H5 files already in data/h5_data/"
     else
-        log "  Step 1/5: Generating raw data..."
+        log "  Step 1/6: Generating raw data..."
         if python script/generate_data.py --config "$config_file" --num $NUM_EPISODES --save-video; then
             log "  ✓ Raw data generation completed"
         else
@@ -321,7 +346,7 @@ prepare_task_data() {
             return 1
         fi
         
-        log "  Step 2/5: Moving h5 files..."
+        log "  Step 2/6: Moving h5 files..."
         local demo_dir="demos/${task_name}/motionplanning"
         if [ -d "$demo_dir" ]; then
             # Find the largest h5 file (main data file)
@@ -346,9 +371,9 @@ prepare_task_data() {
     # Step 3: Convert h5 to pkl
     #--------------------------------------------------------------------------
     if has_pkl_data "$task_name" "$agent_count"; then
-        log "  Step 3/5: ${GREEN}[SKIP]${NC} PKL data already exists for all $agent_count agents"
+        log "  Step 3/6: ${GREEN}[SKIP]${NC} PKL data already exists for all $agent_count agents"
     else
-        log "  Step 3/5: Converting h5 to pkl with batch_size=$H5_BATCH_SIZE and $H5_NUM_WORKERS workers..."
+        log "  Step 3/6: Converting h5 to pkl with batch_size=$H5_BATCH_SIZE and $H5_NUM_WORKERS workers..."
         if python script/parse_h5_to_pkl_multi.py --task_name "$task_name" --load_num $NUM_EPISODES --agent_num $agent_count --batch_size $H5_BATCH_SIZE --num_workers $H5_NUM_WORKERS; then
             log "  ✓ H5 to PKL conversion completed for $agent_count agents + global"
         else
@@ -360,7 +385,7 @@ prepare_task_data() {
     #--------------------------------------------------------------------------
     # Step 4: Convert pkl to zarr (per-agent check)
     #--------------------------------------------------------------------------
-    log "  Step 4/5: Converting pkl to zarr..."
+    log "  Step 4/6: Converting pkl to zarr..."
     local zarr_skipped=0
     local zarr_converted=0
     
@@ -396,7 +421,7 @@ prepare_task_data() {
     #--------------------------------------------------------------------------
     # Step 5: Convert zarr to RLDS (per-agent check)
     #--------------------------------------------------------------------------
-    log "  Step 5/5: Converting zarr to RLDS..."
+    log "  Step 5/6: Converting zarr to RLDS..."
     local rlds_skipped=0
     local rlds_converted=0
     
@@ -507,6 +532,46 @@ print(f'RLDS conversion successful: {output_path}')
     
     log "  ✓ Step 5 complete (converted: $rlds_converted, skipped: $rlds_skipped)"
     
+    #--------------------------------------------------------------------------
+    # Step 6: Convert zarr to LeRobot format (for Pi0/Pi0.5) [per-agent check]
+    #--------------------------------------------------------------------------
+    log "  Step 6/6: Converting zarr to LeRobot format (for Pi0)..."
+    local lerobot_skipped=0
+    local lerobot_converted=0
+
+    # Only convert agent data, NOT global data (Pi0 trains on agent-level policies)
+    for ((agent_id=0; agent_id<agent_count; agent_id++)); do
+        if has_lerobot_data_agent "$task_name" "$agent_id"; then
+            log "    Agent $agent_id: ${GREEN}[SKIP]${NC} LeRobot data already exists"
+            lerobot_skipped=$((lerobot_skipped + 1))
+        else
+            local zarr_path="data/zarr_data/${task_name}_Agent${agent_id}_${NUM_EPISODES}.zarr"
+            if [ -d "$zarr_path" ]; then
+                # Execute from OpenMARL root to handle imports correctly
+                if cd .. && PYTHONPATH=/workspace/OpenMARL python /workspace/OpenMARL/robofactory/policy/Pi0/pi0_policy/utils/data_conversion.py \
+                    --zarr_path="robofactory/$zarr_path" \
+                    --output_dir="robofactory/data/lerobot_data" \
+                    --task_name="$task_name" \
+                    --agent_id=$agent_id \
+                    --num_episodes=$NUM_EPISODES; then
+                    log "    Agent $agent_id: ✓ ZARR to LeRobot conversion completed"
+                    lerobot_converted=$((lerobot_converted + 1))
+                    cd robofactory
+                else
+                    log "    Agent $agent_id: ${YELLOW}[WARN]${NC} ZARR to LeRobot conversion failed"
+                    cd robofactory 2>/dev/null || true  # Make sure we return even on error
+                fi
+            else
+                log "    Agent $agent_id: ${YELLOW}[WARN]${NC} ZARR data not found, skipping LeRobot"
+            fi
+        fi
+    done
+
+    # Explicitly SKIP global data for Pi0/Pi0.5
+    log "    Global: ${YELLOW}[SKIP]${NC} Global data not needed for Pi0 (action-prediction model)"
+
+    log "  ✓ Step 6 complete (converted: $lerobot_converted, skipped: $lerobot_skipped)"
+    
     log "${GREEN}✓ Task $task_name data preparation completed successfully!${NC}"
     return 0
 }
@@ -536,7 +601,7 @@ main() {
 
     # Ensure data directories exist
     log "Creating data directories..."
-    mkdir -p data/{h5_data,pkl_data,zarr_data,rlds_data}
+    mkdir -p data/{h5_data,pkl_data,zarr_data,rlds_data,lerobot_data}
     
     local total_tasks=0
     local completed_tasks=0

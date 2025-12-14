@@ -37,6 +37,8 @@ get_policy_dir_name() {
     case "$policy" in
         dp)      echo "diffusion_policy" ;;
         openvla) echo "openvla" ;;
+        pi0)     echo "pi0" ;;
+        pi05)    echo "pi05" ;;
         *)       echo "$policy" ;;
     esac
 }
@@ -57,7 +59,7 @@ show_help() {
     echo "  bash eval.sh --policy <policy> --all_tasks [options]"
     echo ""
     echo "Required Arguments (for single task):"
-    echo "  --policy        Policy type: 'dp' (Diffusion Policy) or 'openvla'"
+    echo "  --policy        Policy type: 'dp', 'openvla', 'pi0', or 'pi05'"
     echo "  --task          Task name (e.g., LiftBarrier-rf)"
     echo "  --config        Config file path (e.g., configs/table/lift_barrier.yaml)"
     echo ""
@@ -77,6 +79,8 @@ show_help() {
     echo "Supported Policies:"
     echo "  dp       - Diffusion Policy (CNN-based)"
     echo "  openvla  - OpenVLA (Vision-Language-Action)"
+    echo "  pi0      - Pi-0 (Flow-based VLA)"
+    echo "  pi05     - Pi-0.5 (Flow-based VLA)"
     echo ""
     echo "Examples:"
     echo "  # Evaluate single task with Diffusion Policy"
@@ -120,8 +124,8 @@ while [[ $# -gt 0 ]]; do
 done
 
 # Validate policy
-if [[ "$POLICY" != "dp" && "$POLICY" != "openvla" ]]; then
-    echo -e "${RED}Error: Invalid policy '$POLICY'. Use 'dp' or 'openvla'${NC}"
+if [[ "$POLICY" != "dp" && "$POLICY" != "openvla" && "$POLICY" != "pi0" && "$POLICY" != "pi05" ]]; then
+    echo -e "${RED}Error: Invalid policy '$POLICY'. Use 'dp', 'openvla', 'pi0', or 'pi05'${NC}"
     exit 1
 fi
 
@@ -306,6 +310,44 @@ eval_openvla() {
     return 0
 }
 
+eval_pi0() {
+    local task="$1"
+    local config="$2"
+    local policy_dir=$(get_policy_dir_name "$POLICY")
+    
+    log "${BLUE}Evaluating Pi-${POLICY#pi} (Physical Intelligence VLA)${NC}"
+    log "  Task: ${task}"
+    log "  Config: ${config}"
+    log "  Checkpoint: ${CHECKPOINT_NUM}"
+    log "  Episodes: ${NUM_EVAL}"
+    
+    cd robofactory
+    
+    # Check if checkpoint exists
+    local checkpoint_dir="checkpoints/${policy_dir}/${task}_Agent0_${DATA_NUM}"
+    if [[ ! -d "$checkpoint_dir" ]]; then
+        log "${YELLOW}Warning: Checkpoint directory not found: ${checkpoint_dir}${NC}"
+        log "${YELLOW}Make sure the policy is trained before evaluation${NC}"
+        cd ..
+        return 1
+    fi
+    
+    # Use config path relative to robofactory
+    local relative_config="${config#robofactory/}"
+    
+    # Call eval_multi_pi0.sh for parallel multi-GPU evaluation
+    bash policy/Pi0/eval_multi.sh \
+        "$relative_config" \
+        "$DATA_NUM" \
+        "$CHECKPOINT_NUM" \
+        "$DEBUG_MODE" \
+        "$task" \
+        "$POLICY"
+    
+    cd ..
+    return 0
+}
+
 # Dispatcher function
 evaluate_task() {
     local task="$1"
@@ -314,6 +356,7 @@ evaluate_task() {
     case "$POLICY" in
         dp)      eval_diffusion_policy "$task" "$config" ;;
         openvla) eval_openvla "$task" "$config" ;;
+        pi0|pi05) eval_pi0 "$task" "$config" ;;
     esac
 }
 

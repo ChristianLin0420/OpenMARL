@@ -1,0 +1,24 @@
+# Pi0/Pi0.5 Policy Requirements
+# These are additional dependencies beyond robofactory base requirements
+
+# LeRobot for dataset handling (required for data conversion and training)
+lerobot>=0.2.0
+
+# Transformers (specific version for compatibility)
+transformers==4.53.2
+
+# Additional utilities
+einops>=0.7.0
+tyro>=0.7.0
+
+# Image processing
+Pillow>=9.0.0
+
+# For normalization statistics
+scipy>=1.9.0
+
+# Note: openpi is NOT included in base image due to dependency conflicts
+# It will be installed separately when needed for training:
+# Option 1: Install in a separate conda env
+# Option 2: Install with: pip install git+https://github.com/Physical-Intelligence/openpi.git@main
+# Option 3: Use openpi's official Docker image as base for training

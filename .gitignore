@@ -71,3 +71,4 @@ auto.sh
 
 # Logs
 logs/
+wandb/
