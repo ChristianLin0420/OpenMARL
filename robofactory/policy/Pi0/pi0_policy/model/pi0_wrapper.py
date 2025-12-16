@@ -306,21 +306,27 @@ class Pi0Model(nn.Module):
         batch_size = state.shape[0] if state.ndim > 1 else 1
         max_token_len = self.config.max_token_len
         
-        # Pi0 pretrained model expects 32-dimensional state and action spaces
-        # RoboFactory uses 8 dimensions, so we pad to match the expected size
+        # Pi0/Pi0.5 pretrained models have specific dimension requirements
+        # Pi0: state goes through state_proj (32 dims required)
+        # Pi0.5: state is tokenized as discrete input (NOT passed through state_proj)
+        # Both: actions always need 32 dimensions
         pretrained_dim = 32
+        is_pi05 = self.config.pi05
         
-        # Pad state from 8 -> 32 dimensions
-        current_state_dim = state.shape[-1]
-        if current_state_dim < pretrained_dim:
-            state_padding = torch.zeros(
-                (*state.shape[:-1], pretrained_dim - current_state_dim),
-                dtype=state.dtype,
-                device=state.device
-            )
-            state = torch.cat([state, state_padding], dim=-1)
+        # Pad state from 8 -> 32 dimensions (ONLY for Pi0, not Pi0.5)
+        # Pi0.5 uses discrete state input which doesn't require padding
+        if not is_pi05:
+            current_state_dim = state.shape[-1]
+            if current_state_dim < pretrained_dim:
+                state_padding = torch.zeros(
+                    (*state.shape[:-1], pretrained_dim - current_state_dim),
+                    dtype=state.dtype,
+                    device=state.device
+                )
+                state = torch.cat([state, state_padding], dim=-1)
         
-        # Pad actions from 8 -> 32 dimensions (actions shape: [batch, horizon, action_dim])
+        # Pad actions from 8 -> 32 dimensions (required for BOTH Pi0 and Pi0.5)
+        # Actions are always processed through action_in_proj which expects 32 dims
         if actions is not None:
             current_action_dim = actions.shape[-1]
             if current_action_dim < pretrained_dim:
@@ -377,6 +383,9 @@ class Pi0Model(nn.Module):
             with torch.no_grad():
                 with torch.amp.autocast('cuda', dtype=torch.bfloat16):
                     pred_actions = self.model.sample_actions(self.device, observation)
+            # Truncate actions from padded 32 dims back to actual action_dim
+            # pred_actions shape: [batch, action_horizon, 32] -> [batch, action_horizon, action_dim]
+            pred_actions = pred_actions[..., :self.action_dim]
             return None, pred_actions
     
     def compute_loss(self, batch: Dict) -> torch.Tensor:

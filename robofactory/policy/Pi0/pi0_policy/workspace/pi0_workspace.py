@@ -88,6 +88,35 @@ class Pi0Workspace:
         # For periodic logging (following openpi)
         self.step_infos = []
         self.start_time = time.time()
+        
+        # Checkpoint directory following OpenVLA pattern: robofactory/checkpoints/pi0/{task_name}/
+        self._init_checkpoint_dir()
+    
+    def _init_checkpoint_dir(self):
+        """Initialize checkpoint directory following OpenVLA pattern."""
+        # Get task name and agent info from config
+        task_name = self.cfg.task.name if hasattr(self.cfg.task, 'name') else self.cfg.get('task_name', 'unknown')
+        agent_id = self.cfg.get('agent_id', 0)
+        
+        # Extract data count from lerobot_path if available
+        data_count = "150"  # default
+        if hasattr(self.cfg.task, 'lerobot_path'):
+            lerobot_path = self.cfg.task.lerobot_path
+            # Extract number from path like "robofactory/data/lerobot_data/LiftBarrier-rf_Agent0_5"
+            import re
+            match = re.search(r'_(\d+)$', lerobot_path)
+            if match:
+                data_count = match.group(1)
+        
+        # Model type (pi0 or pi05)
+        model_type = self.cfg.model.get('model_variant', 'pi0')
+        
+        # Checkpoint directory: robofactory/checkpoints/pi0/{task_name}_Agent{agent_id}_{data_count}/
+        self.checkpoint_dir = Path('robofactory/checkpoints') / model_type / f"{task_name}_Agent{agent_id}_{data_count}"
+        self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        
+        if self.is_main_process:
+            print(f"Checkpoint directory: {self.checkpoint_dir}")
     
     def _setup_ddp(self):
         """Setup DDP (following openpi's setup_ddp)."""
@@ -266,12 +295,11 @@ class Pi0Workspace:
         
         if not cfg.logging.wandb_enabled or cfg.logging.mode == "disabled":
             wandb.init(mode="disabled")
+            self.wandb_run_id = None
             return
         
-        checkpoint_dir = self.output_dir / "checkpoints"
-        checkpoint_dir.mkdir(parents=True, exist_ok=True)
-        
-        wandb_id_file = checkpoint_dir / "wandb_id.txt"
+        # Use checkpoint_dir for wandb_id file
+        wandb_id_file = self.checkpoint_dir / "wandb_id.txt"
         
         if resuming and wandb_id_file.exists():
             run_id = wandb_id_file.read_text().strip()
@@ -280,6 +308,7 @@ class Pi0Workspace:
                 resume="must",
                 project=cfg.logging.project,
             )
+            self.wandb_run_id = run_id
             print(f"Resumed wandb run: {run_id}")
         else:
             wandb.init(
@@ -290,8 +319,50 @@ class Pi0Workspace:
                 mode=cfg.logging.mode,
             )
             # Save wandb ID for resuming
+            self.wandb_run_id = wandb.run.id
             wandb_id_file.write_text(wandb.run.id)
             print(f"Started new wandb run: {wandb.run.id}")
+    
+    def _log_sample_observations(self):
+        """Log sample observations to wandb (following openpi's pattern)."""
+        if not self.is_main_process:
+            return
+        
+        if not self.cfg.logging.wandb_enabled or self.cfg.logging.mode == "disabled":
+            return
+        
+        try:
+            # Get a sample batch from the dataloader
+            sample_batch = next(iter(self.train_dataloader))
+            sample_batch = self._move_batch_to_device(sample_batch)
+            
+            # Create sample images for wandb - concatenate all camera views
+            images_to_log = []
+            image_dict = sample_batch["image"]
+            batch_size = next(iter(image_dict.values())).shape[0]
+            
+            for i in range(min(5, batch_size)):
+                # Concatenate all camera views horizontally for this batch item
+                # Images are in NCHW format, convert to NHWC for wandb
+                img_list = []
+                for cam_name in sorted(image_dict.keys()):
+                    img = image_dict[cam_name][i]  # CHW
+                    img = img.permute(1, 2, 0)  # HWC
+                    img = img.cpu().numpy()
+                    # Normalize to [0, 255] if needed
+                    if img.max() <= 1.0:
+                        img = (img * 255).astype(np.uint8)
+                    img_list.append(img)
+                
+                # Concatenate horizontally
+                img_concatenated = np.concatenate(img_list, axis=1)
+                images_to_log.append(wandb.Image(img_concatenated, caption=f"Sample {i}"))
+            
+            wandb.log({"sample_observations": images_to_log}, step=0)
+            print(f"Logged {len(images_to_log)} sample observations to wandb")
+            
+        except Exception as e:
+            print(f"Warning: Could not log sample observations to wandb: {e}")
     
     def run(self):
         """Main training loop."""
@@ -311,10 +382,9 @@ class Pi0Workspace:
         # Initialize wandb
         self._init_wandb(resuming=resuming)
         
-        if self.is_main_process:
-            print(f"\nStarting training from epoch {self.epoch}")
-            print(f"Training for {self.cfg.training.num_epochs} epochs")
-            print(f"Global step: {self.global_step}")
+        # Log sample observations to wandb (only on new runs, not resume)
+        if not resuming:
+            self._log_sample_observations()
         
         # Training loop
         for epoch in range(self.epoch, self.cfg.training.num_epochs):
@@ -340,16 +410,16 @@ class Pi0Workspace:
                             "epoch": epoch + 1,
                         }, step=self.global_step)
             
-            # Save checkpoint
+            # Save checkpoint (using epoch number like OpenVLA)
             if (epoch + 1) % self.cfg.training.checkpoint_every == 0:
-                self._save_checkpoint()
+                self._save_checkpoint(epoch=epoch + 1)
             
             # Step scheduler
             if self.scheduler is not None:
                 self.scheduler.step()
         
         # Final checkpoint
-        self._save_checkpoint()
+        self._save_checkpoint(epoch=num_epochs)
         
         # Cleanup
         if self.use_ddp:
@@ -478,45 +548,60 @@ class Pi0Workspace:
                 result[key] = value
         return result
     
-    def _save_checkpoint(self):
-        """Save model checkpoint (following openpi's save_checkpoint pattern)."""
+    def _save_checkpoint(self, name: Optional[str] = None, epoch: Optional[int] = None):
+        """Save model checkpoint (following OpenVLA's epoch-based naming pattern)."""
         if not self.is_main_process:
             return
         
-        checkpoint_dir = self.output_dir / "checkpoints" / str(self.global_step)
-        tmp_checkpoint_dir = self.output_dir / "checkpoints" / f"tmp_{self.global_step}"
+        # Use checkpoint_dir following OpenVLA pattern with epoch naming
+        if name is None:
+            if epoch is not None:
+                name = f"epoch_{epoch}"
+            else:
+                name = str(self.global_step)
+        checkpoint_path = self.checkpoint_dir / name
+        tmp_checkpoint_path = self.checkpoint_dir / f"tmp_{name}"
         
         # Create temp directory
-        if tmp_checkpoint_dir.exists():
+        if tmp_checkpoint_path.exists():
             import shutil
-            shutil.rmtree(tmp_checkpoint_dir)
-        tmp_checkpoint_dir.mkdir(parents=True, exist_ok=True)
+            shutil.rmtree(tmp_checkpoint_path)
+        tmp_checkpoint_path.mkdir(parents=True, exist_ok=True)
         
         # Get model to save
         model_to_save = self.model.module if isinstance(self.model, DDP) else self.model
         
         # Save model using safetensors (following openpi)
         import safetensors.torch
-        safetensors.torch.save_model(model_to_save.model, tmp_checkpoint_dir / "model.safetensors")
+        safetensors.torch.save_model(model_to_save.model, tmp_checkpoint_path / "model.safetensors")
         
         # Save optimizer
-        torch.save(self.optimizer.state_dict(), tmp_checkpoint_dir / "optimizer.pt")
+        torch.save(self.optimizer.state_dict(), tmp_checkpoint_path / "optimizer.pt")
         
         # Save training metadata
         metadata = {
             "global_step": self.global_step,
             "epoch": self.epoch,
             "best_loss": self.best_loss,
+            "wandb_run_id": getattr(self, 'wandb_run_id', None),
         }
-        torch.save(metadata, tmp_checkpoint_dir / "metadata.pt")
+        torch.save(metadata, tmp_checkpoint_path / "metadata.pt")
         
         # Atomically move temp to final location
-        if checkpoint_dir.exists():
+        if checkpoint_path.exists():
             import shutil
-            shutil.rmtree(checkpoint_dir)
-        tmp_checkpoint_dir.rename(checkpoint_dir)
+            shutil.rmtree(checkpoint_path)
+        tmp_checkpoint_path.rename(checkpoint_path)
         
-        print(f"Saved checkpoint at step {self.global_step} -> {checkpoint_dir}")
+        # Also save as latest for easy resuming
+        latest_path = self.checkpoint_dir / "latest"
+        if latest_path.exists():
+            import shutil
+            shutil.rmtree(latest_path)
+        import shutil
+        shutil.copytree(checkpoint_path, latest_path)
+        
+        print(f"Saved checkpoint at {name} (step {self.global_step}) -> {checkpoint_path}")
         
         # Log to wandb
         if self.cfg.logging.wandb_enabled:
@@ -532,16 +617,28 @@ class Pi0Workspace:
         if not self.cfg.training.resume:
             return False
         
-        checkpoint_dir = self.output_dir / "checkpoints"
-        if not checkpoint_dir.exists():
+        # Use checkpoint_dir following OpenVLA pattern
+        if not self.checkpoint_dir.exists():
             return False
         
-        # Find latest checkpoint
-        checkpoints = [d for d in checkpoint_dir.iterdir() if d.is_dir() and d.name.isdigit()]
-        if not checkpoints:
-            return False
-        
-        latest_checkpoint = max(checkpoints, key=lambda x: int(x.name))
+        # First try "latest" checkpoint
+        latest_checkpoint = self.checkpoint_dir / "latest"
+        if not latest_checkpoint.exists():
+            # Fall back to finding highest numbered/epoch checkpoint
+            checkpoints = []
+            for d in self.checkpoint_dir.iterdir():
+                if d.is_dir():
+                    if d.name.isdigit():
+                        checkpoints.append((int(d.name), d))
+                    elif d.name.startswith("epoch_"):
+                        try:
+                            epoch_num = int(d.name.split("_")[1])
+                            checkpoints.append((epoch_num * 10000, d))  # Prioritize epoch checkpoints
+                        except:
+                            pass
+            if not checkpoints:
+                return False
+            latest_checkpoint = max(checkpoints, key=lambda x: x[0])[1]
         
         if self.is_main_process:
             print(f"Loading checkpoint from {latest_checkpoint}")

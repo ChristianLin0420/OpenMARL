@@ -8,14 +8,23 @@ This module follows the openpi data pipeline conventions:
 - Action key: "actions"
 - Task key: "task" (for language instructions)
 
-RoboFactory camera order in ZARR 'img' array:
-[0] head_camera - side view (fixed position) → base_0_rgb
-[1] global_camera - overhead view (bird's eye) → left_wrist_0_rgb
-[2] wrist_camera - gripper view (end-effector) → right_wrist_0_rgb
+RoboFactory ZARR Data Structure:
+- Agent ZARR: {TASK}_Agent{ID}_{NUM}.zarr
+    - head_camera: side view (fixed position) → base_0_rgb
+    - wrist_camera: gripper view (end-effector) → right_wrist_0_rgb
+    
+- Global ZARR: {TASK}_Agent{ID}_global_{NUM}.zarr
+    - head_camera: overhead/global view (bird's eye) → left_wrist_0_rgb
+
+Pi0 3-Camera Mapping:
+- base_0_rgb      ← head_camera from Agent ZARR (side view)
+- left_wrist_0_rgb ← head_camera from Global ZARR (overhead view)
+- right_wrist_0_rgb ← wrist_camera from Agent ZARR (gripper view)
 """
 
 import json
 import os
+import re
 import shutil
 from pathlib import Path
 from typing import Dict, Optional
@@ -51,12 +60,6 @@ except ImportError:
 def _process_image(image: np.ndarray) -> np.ndarray:
     """
     Process image to ensure correct format (HWC, uint8).
-    
-    Args:
-        image: Input image array
-        
-    Returns:
-        Processed image in HWC uint8 format
     """
     # Ensure image is in HWC format (H, W, C)
     if len(image.shape) == 3 and image.shape[0] == 3:
@@ -80,30 +83,10 @@ def convert_zarr_to_lerobot(
     agent_id: int,
     num_episodes: int,
     language_instruction: Optional[str] = None,
+    global_zarr_path: Optional[str] = None,
 ) -> str:
     """
     Convert ZARR dataset to LeRobot format for Pi0/Pi0.5.
-    
-    RoboFactory camera order (in ZARR 'img' array):
-    [0] head_camera - side view (fixed position)
-    [1] global_camera - overhead view (bird's eye)
-    [2] wrist_camera - gripper view (end-effector)
-    
-    Maps to Pi0's 3-camera requirement:
-    - base_0_rgb <- head_camera [0]
-    - left_wrist_0_rgb <- global_camera [1]
-    - right_wrist_0_rgb <- wrist_camera [2]
-    
-    Args:
-        zarr_path: Path to input ZARR dataset
-        output_dir: Directory to save LeRobot dataset
-        task_name: Name of the task (e.g., "LiftBarrier-rf")
-        agent_id: Agent ID
-        num_episodes: Number of episodes in dataset
-        language_instruction: Language instruction for the task
-        
-    Returns:
-        Repo ID of created LeRobot dataset
     """
     if LeRobotDataset is None:
         raise ImportError("LeRobot is required. Install with: pip install lerobot>=0.2.0")
@@ -114,53 +97,63 @@ def convert_zarr_to_lerobot(
     data_group = root['data']
     meta_group = root['meta']
     
+    # Load global ZARR if provided (contains overhead camera view)
+    global_data_group = None
+    if global_zarr_path and Path(global_zarr_path).exists():
+        print(f"Loading global view ZARR from {global_zarr_path}...")
+        global_root = zarr.open(global_zarr_path, mode='r')
+        global_data_group = global_root['data']
+        print(f"  ✓ Global ZARR loaded (overhead camera view)")
+    elif global_zarr_path:
+        print(f"  WARNING: Global ZARR not found at {global_zarr_path}, will duplicate head_camera")
+    else:
+        # Try to auto-detect global ZARR path
+        # Agent ZARR: LiftBarrier-rf_Agent0_5.zarr
+        # Global ZARR: LiftBarrier-rf_global_5.zarr (no agent ID!)
+        zarr_stem = Path(zarr_path).stem  # e.g., "LiftBarrier-rf_Agent0_5"
+        
+        # Extract task name and number
+        # Pattern: {task}_Agent{id}_{num} -> {task}_global_{num}
+        match = re.match(r'(.+)_Agent\d+_(\d+)$', zarr_stem)
+        if match:
+            task_name_part = match.group(1)  # "LiftBarrier-rf"
+            num_part = match.group(2)         # "5"
+            global_zarr_name = f"{task_name_part}_global_{num_part}.zarr"
+            auto_global_path = Path(zarr_path).parent / global_zarr_name
+            if auto_global_path.exists():
+                print(f"Auto-detected global ZARR: {auto_global_path}")
+                global_root = zarr.open(str(auto_global_path), mode='r')
+                global_data_group = global_root['data']
+                print(f"  ✓ Global ZARR loaded (overhead camera view)")
+            else:
+                print(f"  INFO: No global ZARR found at {auto_global_path}, will duplicate head_camera")
+        else:
+            print(f"  INFO: Could not parse ZARR name pattern, will duplicate head_camera")
+    
     # Get episode boundaries
     episode_ends = np.array(meta_group['episode_ends'])
     
     # Check which camera format is used
-    has_img_array = 'img' in data_group
-    has_separate_cameras = 'head_camera' in data_group or 'wrist_camera' in data_group
+    has_separate_cameras = 'head_camera' in data_group
     
-    if has_img_array:
-        # Old format: single 'img' array with all cameras
-        # Get image dimensions from first frame
-        first_img = data_group['img'][0]  # Shape: (num_cameras, C, H, W) or (num_cameras, H, W, C)
-        num_cameras = first_img.shape[0]
-        
-        # Determine if CHW or HWC format
-        if first_img.shape[1] == 3:  # CHW format: (num_cameras, 3, H, W)
-            img_h, img_w = first_img.shape[2], first_img.shape[3]
-            is_chw = True
-        else:  # HWC format: (num_cameras, H, W, 3)
-            img_h, img_w = first_img.shape[1], first_img.shape[2]
-            is_chw = False
-        
-        print(f"Found {num_cameras} cameras with resolution {img_h}x{img_w} (img array format)")
-        use_separate_cameras = False
-        
-    elif has_separate_cameras:
-        # New format: separate arrays for each camera
-        # Get image dimensions from first camera
-        first_cam = data_group.get('head_camera', data_group.get('wrist_camera'))
-        first_img = first_cam[0]
-        
-        # Determine if CHW or HWC format
-        if first_img.shape[0] == 3:  # CHW format: (3, H, W)
+    if has_separate_cameras:
+        first_img = data_group['head_camera'][0]
+        if first_img.shape[0] == 3:
             img_h, img_w = first_img.shape[1], first_img.shape[2]
             is_chw = True
-        else:  # HWC format: (H, W, 3)
+        else:
             img_h, img_w = first_img.shape[0], first_img.shape[1]
             is_chw = False
-        
         print(f"Found separate camera arrays with resolution {img_h}x{img_w}")
-        print(f"  - head_camera → base_0_rgb")
-        if 'global_camera' in data_group:
-            print(f"  - global_camera → left_wrist_0_rgb")
-        print(f"  - wrist_camera → right_wrist_0_rgb")
-        use_separate_cameras = True
-        
     else:
-        raise ValueError(f"No camera data found in ZARR at {zarr_path}. Expected 'img' array or separate camera arrays.")
+        first_img = data_group['img'][0]
+        if first_img.shape[1] == 3:
+            img_h, img_w = first_img.shape[2], first_img.shape[3]
+            is_chw = True
+        else:
+            img_h, img_w = first_img.shape[1], first_img.shape[2]
+            is_chw = False
+        print(f"Found img array with resolution {img_h}x{img_w}")
     
     # Get action and state dimensions
     action_dim = data_group['action'].shape[-1]
@@ -171,58 +164,55 @@ def convert_zarr_to_lerobot(
     repo_id = f"{task_name}_Agent{agent_id}_{num_episodes}"
     output_path = Path(output_dir) / repo_id
     
+    # Remove existing output if it exists
     if output_path.exists():
         print(f"Removing existing dataset at {output_path}")
         shutil.rmtree(output_path)
     
-    # Clean cache if it exists to avoid conflicts with LeRobot's exist_ok=False
+    # Clean HuggingFace cache for this repo to avoid conflicts
     cache_path = Path.home() / ".cache" / "huggingface" / "lerobot" / repo_id
     if cache_path.exists():
-        print(f"Cleaning existing cache at {cache_path}")
+        print(f"Cleaning cache at {cache_path}")
         shutil.rmtree(cache_path)
     
     print(f"Creating LeRobot dataset: {repo_id}")
-    print(f"  Output path: {output_path}")
     print(f"  Action dim: {action_dim}, State dim: {state_dim}")
     
-    # Create LeRobot dataset with Pi0's exact 3-camera format
-    # DON'T specify root - let it use default location, then we'll move it
+    # Create LeRobot dataset with Pi0's 3-camera format
+    # Use single-threaded image writing to prevent parquet corruption
     dataset = LeRobotDataset.create(
         repo_id=repo_id,
         robot_type="panda",
-        fps=10,  # RoboFactory default
+        fps=10,
         features={
-            # Pi0's 3 required cameras (exact naming convention)
-            "base_0_rgb": {  # Head/side camera [0]
+            "base_0_rgb": {
                 "dtype": "image",
                 "shape": (img_h, img_w, 3),
                 "names": ["height", "width", "channel"],
             },
-            "left_wrist_0_rgb": {  # Global/overhead camera [1]
+            "left_wrist_0_rgb": {
                 "dtype": "image",
                 "shape": (img_h, img_w, 3),
                 "names": ["height", "width", "channel"],
             },
-            "right_wrist_0_rgb": {  # Wrist/gripper camera [2]
+            "right_wrist_0_rgb": {
                 "dtype": "image",
                 "shape": (img_h, img_w, 3),
                 "names": ["height", "width", "channel"],
             },
-            # Proprio/state (openpi convention: "state")
             "state": {
                 "dtype": "float32",
                 "shape": (state_dim,),
                 "names": ["state"],
             },
-            # Actions (openpi convention: "actions")
             "actions": {
                 "dtype": "float32",
                 "shape": (action_dim,),
                 "names": ["actions"],
             },
         },
-        image_writer_threads=10,
-        image_writer_processes=5,
+        image_writer_threads=1,
+        image_writer_processes=0,
     )
     
     # Set default language instruction
@@ -236,16 +226,16 @@ def convert_zarr_to_lerobot(
     start_idx = 0
     for ep_idx, end_idx in enumerate(tqdm(episode_ends, desc="Converting episodes")):
         for t in range(start_idx, end_idx):
-            if use_separate_cameras:
-                # New format: read from separate camera arrays
+            if has_separate_cameras:
+                # Read from separate camera arrays
                 head_img = data_group['head_camera'][t]
                 wrist_img = data_group['wrist_camera'][t]
                 
-                # Check if global camera exists, otherwise duplicate head camera
-                if 'global_camera' in data_group:
-                    global_img = data_group['global_camera'][t]
+                # Get global view from global ZARR if available
+                if global_data_group is not None and 'head_camera' in global_data_group:
+                    global_img = global_data_group['head_camera'][t]
                 else:
-                    global_img = head_img.copy()  # Fallback if no global camera
+                    global_img = head_img.copy()
                 
                 # Convert from CHW to HWC if needed
                 if is_chw:
@@ -254,19 +244,35 @@ def convert_zarr_to_lerobot(
                     wrist_img = np.transpose(wrist_img, (1, 2, 0))
             else:
                 # Old format: extract from 'img' array
-                # Camera order: [0]=head/side, [1]=global/overhead, [2]=wrist/gripper
-                img_t = data_group['img'][t]  # Shape: (3, ...) for 3 cameras
+                img_t = data_group['img'][t]
                 
                 if is_chw:
-                    # Convert from (C, H, W) to (H, W, C)
                     head_img = np.transpose(img_t[0], (1, 2, 0))
-                    global_img = np.transpose(img_t[1], (1, 2, 0))
-                    wrist_img = np.transpose(img_t[2], (1, 2, 0))
+                    wrist_img = np.transpose(img_t[2] if img_t.shape[0] > 2 else img_t[1], (1, 2, 0))
                 else:
-                    # Already in (H, W, C) format
                     head_img = img_t[0]
-                    global_img = img_t[1]
-                    wrist_img = img_t[2]
+                    wrist_img = img_t[2] if img_t.shape[0] > 2 else img_t[1]
+                
+                # Get global view
+                if global_data_group is not None:
+                    if 'head_camera' in global_data_group:
+                        global_img = global_data_group['head_camera'][t]
+                        if is_chw:
+                            global_img = np.transpose(global_img, (1, 2, 0))
+                    elif 'img' in global_data_group:
+                        global_img_t = global_data_group['img'][t]
+                        if is_chw:
+                            global_img = np.transpose(global_img_t[0], (1, 2, 0))
+                        else:
+                            global_img = global_img_t[0]
+                    else:
+                        global_img = head_img.copy()
+                else:
+                    # No global ZARR, duplicate head
+                    if is_chw:
+                        global_img = np.transpose(img_t[1] if img_t.shape[0] > 2 else img_t[0], (1, 2, 0))
+                    else:
+                        global_img = img_t[1] if img_t.shape[0] > 2 else img_t[0]
             
             # Ensure uint8 format
             head_img = _process_image(head_img)
@@ -278,11 +284,9 @@ def convert_zarr_to_lerobot(
             action_data = data_group['action'][t]
             
             frame_data = {
-                # Map to Pi0's exact key names IN THE CORRECT ORDER
-                "base_0_rgb": head_img,           # [0] Side view
-                "left_wrist_0_rgb": global_img,   # [1] Overhead view
-                "right_wrist_0_rgb": wrist_img,   # [2] Gripper view
-                
+                "base_0_rgb": head_img,
+                "left_wrist_0_rgb": global_img,
+                "right_wrist_0_rgb": wrist_img,
                 "state": state_data.astype(np.float32),
                 "actions": action_data.astype(np.float32),
                 "task": language_instruction,
@@ -291,34 +295,130 @@ def convert_zarr_to_lerobot(
             dataset.add_frame(frame_data)
         
         dataset.save_episode()
+        
+        # Ensure all writes are flushed
+        if hasattr(dataset, 'image_writer') and dataset.image_writer is not None:
+            try:
+                dataset.image_writer.wait_until_done()
+            except:
+                pass
+        
         start_idx = end_idx
     
+    # Final flush to ensure all data is written
+    if hasattr(dataset, 'consolidate'):
+        try:
+            dataset.consolidate()
+        except:
+            pass
+    
     print(f"✅ Successfully converted {len(episode_ends)} episodes to LeRobot format")
-    print(f"   Camera mapping:")
-    print(f"     base_0_rgb <- head_camera [0] (side view)")
-    print(f"     left_wrist_0_rgb <- global_camera [1] (overhead view)")
-    print(f"     right_wrist_0_rgb <- wrist_camera [2] (gripper view)")
     
     # Move dataset from cache to output directory
-    # LeRobot creates datasets in ~/.cache/huggingface/lerobot by default
-    import os
     cache_path = Path.home() / ".cache" / "huggingface" / "lerobot" / repo_id
     
     if cache_path.exists():
-        # Ensure output directory exists
         Path(output_dir).mkdir(parents=True, exist_ok=True)
-        
-        # Move from cache to target location
         print(f"   Moving dataset from {cache_path} to {output_path}")
         if output_path.exists():
             shutil.rmtree(output_path)
         shutil.move(str(cache_path), str(output_path))
-        print(f"   ✓ Dataset moved to: {output_path}")
+    
+    # Consolidate parquet files in data/chunk-000 to prevent corruption issues
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    
+    data_chunk_dir = output_path / "data" / "chunk-000"
+    actual_total_frames = None
+    if data_chunk_dir.exists():
+        parquet_files = sorted(data_chunk_dir.glob("*.parquet"))
+        if len(parquet_files) >= 1:
+            # Read the parquet to get actual row count
+            main_table = pq.read_table(parquet_files[0])
+            actual_total_frames = len(main_table)
+            
+            if len(parquet_files) > 1:
+                print(f"   Consolidating {len(parquet_files)} parquet files into one...")
+                # Read all parquet files and merge
+                tables = [main_table]
+                for pf in parquet_files[1:]:
+                    try:
+                        tables.append(pq.read_table(pf))
+                    except Exception as e:
+                        print(f"   Warning: Could not read {pf.name}: {e}, skipping")
+                
+                # Merge all tables
+                merged_table = pa.concat_tables(tables)
+                actual_total_frames = len(merged_table)
+                
+                # Remove old files
+                for pf in parquet_files:
+                    pf.unlink()
+                
+                # Write merged file
+                merged_path = data_chunk_dir / "file-000.parquet"
+                pq.write_table(merged_table, merged_path)
+                print(f"   ✓ Consolidated into single file: {merged_path.name} ({actual_total_frames} rows)")
+    
+    # Update info.json with actual total_frames if there was data loss
+    if actual_total_frames is not None:
+        info_path = output_path / "meta" / "info.json"
+        if info_path.exists():
+            with open(info_path, 'r') as f:
+                info = json.load(f)
+            if info.get('total_frames') != actual_total_frames:
+                print(f"   Updating info.json: total_frames {info.get('total_frames')} -> {actual_total_frames}")
+                info['total_frames'] = actual_total_frames
+                with open(info_path, 'w') as f:
+                    json.dump(info, f, indent=4)
+    
+    # Create meta/episodes directory with parquet file (required by LeRobot v3.0+)
+    episodes_chunk_dir = output_path / "meta" / "episodes" / "chunk-000"
+    episodes_chunk_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Calculate episode boundaries for the parquet file
+    # Use actual_total_frames if available (in case of data loss during consolidation)
+    episode_data = []
+    start_idx = 0
+    
+    if actual_total_frames is not None and actual_total_frames < episode_ends[-1]:
+        # Data was lost - recalculate episode boundaries based on available data
+        print(f"   Recalculating episode boundaries (actual frames: {actual_total_frames}, expected: {episode_ends[-1]})")
+        remaining_frames = actual_total_frames
+        for ep_idx, end_idx in enumerate(episode_ends):
+            original_length = end_idx - start_idx
+            if remaining_frames <= 0:
+                break
+            actual_length = min(original_length, remaining_frames)
+            actual_end = start_idx + actual_length
+            episode_data.append({
+                "episode_index": ep_idx,
+                "tasks": [language_instruction],
+                "length": actual_length,
+                "dataset_from_index": start_idx,
+                "dataset_to_index": actual_end,
+            })
+            remaining_frames -= actual_length
+            start_idx = actual_end
     else:
-        print(f"   Output: {output_path}")
+        # Normal case - use original episode boundaries
+        for ep_idx, end_idx in enumerate(episode_ends):
+            episode_length = end_idx - start_idx
+            episode_data.append({
+                "episode_index": ep_idx,
+                "tasks": [language_instruction],
+                "length": episode_length,
+                "dataset_from_index": start_idx,
+                "dataset_to_index": end_idx,
+            })
+            start_idx = end_idx
     
-    print(f"   Repo ID: {repo_id}")
+    table = pa.Table.from_pylist(episode_data)
+    parquet_path = episodes_chunk_dir / "file-000.parquet"
+    pq.write_table(table, parquet_path)
+    print(f"   ✓ Created meta/episodes/chunk-000/file-000.parquet with {len(episode_data)} episodes")
     
+    print(f"   Output: {output_path}")
     return repo_id
 
 
@@ -326,36 +426,12 @@ if __name__ == "__main__":
     import argparse
     
     parser = argparse.ArgumentParser(description="Convert ZARR to LeRobot format for Pi0")
-    parser.add_argument(
-        "--zarr_path",
-        type=str,
-        required=True,
-        help="Path to ZARR file"
-    )
-    parser.add_argument(
-        "--output_dir",
-        type=str,
-        default="data/lerobot_data",
-        help="Output directory for LeRobot datasets"
-    )
-    parser.add_argument(
-        "--task_name",
-        type=str,
-        required=True,
-        help="Task name (e.g., LiftBarrier-rf)"
-    )
-    parser.add_argument(
-        "--agent_id",
-        type=int,
-        required=True,
-        help="Agent ID"
-    )
-    parser.add_argument(
-        "--num_episodes",
-        type=int,
-        required=True,
-        help="Number of episodes in dataset"
-    )
+    parser.add_argument("--zarr_path", type=str, required=True)
+    parser.add_argument("--global_zarr_path", type=str, default=None)
+    parser.add_argument("--output_dir", type=str, default="data/lerobot_data")
+    parser.add_argument("--task_name", type=str, required=True)
+    parser.add_argument("--agent_id", type=int, required=True)
+    parser.add_argument("--num_episodes", type=int, required=True)
     
     args = parser.parse_args()
     
@@ -365,5 +441,5 @@ if __name__ == "__main__":
         task_name=args.task_name,
         agent_id=args.agent_id,
         num_episodes=args.num_episodes,
+        global_zarr_path=args.global_zarr_path,
     )
-

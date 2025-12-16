@@ -534,27 +534,39 @@ print(f'RLDS conversion successful: {output_path}')
     
     #--------------------------------------------------------------------------
     # Step 6: Convert zarr to LeRobot format (for Pi0/Pi0.5) [per-agent check]
+    # NOTE: Pi0/Pi0.5 uses 3 cameras: head (side), global (overhead), wrist (gripper)
+    #       - Agent ZARR provides: head_camera + wrist_camera
+    #       - Global ZARR provides: overhead camera (global view for that agent)
     #--------------------------------------------------------------------------
     log "  Step 6/6: Converting zarr to LeRobot format (for Pi0)..."
     local lerobot_skipped=0
     local lerobot_converted=0
 
-    # Only convert agent data, NOT global data (Pi0 trains on agent-level policies)
+    # Convert agent data WITH global camera view
     for ((agent_id=0; agent_id<agent_count; agent_id++)); do
         if has_lerobot_data_agent "$task_name" "$agent_id"; then
             log "    Agent $agent_id: ${GREEN}[SKIP]${NC} LeRobot data already exists"
             lerobot_skipped=$((lerobot_skipped + 1))
         else
             local zarr_path="data/zarr_data/${task_name}_Agent${agent_id}_${NUM_EPISODES}.zarr"
+            # Global ZARR uses different naming: {task}_global_{num}.zarr (no agent ID)
+            local global_zarr_path="data/zarr_data/${task_name}_global_${NUM_EPISODES}.zarr"
+            
             if [ -d "$zarr_path" ]; then
+                # Build command with optional global ZARR path
+                local cmd_args="--zarr_path=robofactory/$zarr_path --output_dir=robofactory/data/lerobot_data --task_name=$task_name --agent_id=$agent_id --num_episodes=$NUM_EPISODES"
+                
+                # Add global ZARR path if it exists
+                if [ -d "$global_zarr_path" ]; then
+                    log "    Agent $agent_id: Found global ZARR at $global_zarr_path"
+                    cmd_args="$cmd_args --global_zarr_path=robofactory/$global_zarr_path"
+                else
+                    log "    Agent $agent_id: No global ZARR found, will auto-detect"
+                fi
+                
                 # Execute from OpenMARL root to handle imports correctly
-                if cd .. && PYTHONPATH=/workspace/OpenMARL python /workspace/OpenMARL/robofactory/policy/Pi0/pi0_policy/utils/data_conversion.py \
-                    --zarr_path="robofactory/$zarr_path" \
-                    --output_dir="robofactory/data/lerobot_data" \
-                    --task_name="$task_name" \
-                    --agent_id=$agent_id \
-                    --num_episodes=$NUM_EPISODES; then
-                    log "    Agent $agent_id: ✓ ZARR to LeRobot conversion completed"
+                if cd .. && PYTHONPATH=/workspace/OpenMARL python /workspace/OpenMARL/robofactory/policy/Pi0/pi0_policy/utils/data_conversion.py $cmd_args; then
+                    log "    Agent $agent_id: ✓ ZARR to LeRobot conversion completed (with global view)"
                     lerobot_converted=$((lerobot_converted + 1))
                     cd robofactory
                 else
@@ -566,9 +578,6 @@ print(f'RLDS conversion successful: {output_path}')
             fi
         fi
     done
-
-    # Explicitly SKIP global data for Pi0/Pi0.5
-    log "    Global: ${YELLOW}[SKIP]${NC} Global data not needed for Pi0 (action-prediction model)"
 
     log "  ✓ Step 6 complete (converted: $lerobot_converted, skipped: $lerobot_skipped)"
     

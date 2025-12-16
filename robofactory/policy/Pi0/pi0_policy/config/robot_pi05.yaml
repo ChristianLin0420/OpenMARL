@@ -9,38 +9,37 @@ task_name: ${task.name}
 exp_name: "pi05"
 agent_id: 0  # Override via command line: agent_id=0, agent_id=1, etc.
 
-# Model configuration (following openpi's Pi0Config for pi05)
+# Model configuration for Pi0.5 (following openpi's Pi0Config with pi05=True)
 model:
-  model_variant: "pi05"
+  model_variant: "pi05"  # Key difference from pi0
   
   # Model architecture (from openpi.models.pi0_config.Pi0Config)
   paligemma_variant: "gemma_2b"
   action_expert_variant: "gemma_300m"
   action_dim: 8
   action_horizon: 50
-  max_token_len: 200  # Pi0.5 uses longer context (200 vs 48 for pi0)
+  max_token_len: 200  # Pi0.5 uses 200 tokens (vs 48 for Pi0)
   
-  # Pretrained checkpoint (from openpi)
+  # Pretrained checkpoint for Pi0.5 (from openpi)
   pretrained_checkpoint: "gs://openpi-assets/checkpoints/pi05_base"
   
   # Precision (following openpi)
   dtype: "bfloat16"
-  pytorch_training_precision: "bfloat16"  # or "float32"
+  pytorch_training_precision: "bfloat16"  # or "float32" for higher precision
   
   # Memory optimization
   use_gradient_checkpointing: true
   
-  # Flow matching (enabled for pi05)
+  # Pi0.5 specifics:
+  # - Uses discrete state input (tokenized as part of language, not continuous embedding)
+  # - Uses adaRMSNorm for timestep injection (instead of MLP)
   use_flow_matching: true
-  
-  # Pi0.5 specific: discrete state input
-  discrete_state_input: true
 
 # Training configuration (following openpi's train_pytorch.py)
 training:
   device: "cuda:0"
   seed: 42
-  num_epochs: 300
+  num_epochs: 3
   
   # Optimizer (openpi defaults)
   learning_rate: 5.0e-4
@@ -58,26 +57,26 @@ training:
   val_every: 10
   
   # Checkpointing (following openpi pattern)
-  checkpoint_every: 50
+  checkpoint_every: 1
   save_interval: 5000  # Save every N steps (openpi convention)
   resume: true
 
 # Dataloader configuration
 dataloader:
-  batch_size: 16
-  num_workers: 4
+  batch_size: 8
+  num_workers: 0  # Set to 0 to avoid shared memory issues in Docker
   shuffle: true
   pin_memory: true
 
 val_dataloader:
-  batch_size: 16
-  num_workers: 4
+  batch_size: 8
+  num_workers: 0  # Set to 0 to avoid shared memory issues in Docker
   shuffle: false
   pin_memory: true
 
 # Logging configuration (following openpi's train_pytorch.py)
 logging:
-  project: "openmarl_pi05"
+  project: "test"
   mode: "online"  # "online", "offline", or "disabled"
   name: "${task_name}_${exp_name}_Agent${agent_id}"
   tags: ["pi05", "${task_name}", "Agent${agent_id}"]
@@ -93,4 +92,3 @@ hydra:
   sweep:
     dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
     subdir: ${hydra.job.num}
-

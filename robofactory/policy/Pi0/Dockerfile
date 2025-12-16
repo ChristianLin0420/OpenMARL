@@ -136,7 +136,7 @@ RUN pip install -e /workspace/OpenMARL
 RUN pip install --no-cache-dir wandb[media]
 
 # Install google cloud storage
-RUN pip install gcfs
+RUN pip install gcsfs
 
 # Create necessary directories
 RUN mkdir -p \
