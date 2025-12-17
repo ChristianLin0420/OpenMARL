@@ -33,7 +33,7 @@ model:
 training:
   device: "cuda:0"
   seed: 42
-  num_epochs: 3
+  num_epochs: 30
   learning_rate: 5.0e-4
   min_learning_rate: 1.0e-6
   weight_decay: 1.0e-6
@@ -53,7 +53,7 @@ training:
   val_every: 5                        # Validate every 5 epochs
   
   # Checkpointing
-  checkpoint_every: 1                # Checkpoint every 10 epochs
+  checkpoint_every: 10                # Checkpoint every 10 epochs
   resume: True
   
   # Early stopping
@@ -75,20 +75,20 @@ training:
 
 # Dataloader configuration
 dataloader:
-  batch_size: 2
-  num_workers: 0  # Set to 0 to avoid Docker shared memory issues
+  batch_size: 8
+  num_workers: 4  # Set to 0 to avoid Docker shared memory issues
   shuffle: True
   pin_memory: True
 
 val_dataloader:
-  batch_size: 2
-  num_workers: 0  # Set to 0 to avoid Docker shared memory issues
+  batch_size: 8
+  num_workers: 4  # Set to 0 to avoid Docker shared memory issues
   shuffle: False
   pin_memory: True
 
 # Logging configuration
 logging:
-  project: "test"
+  project: "openmarl"
   mode: "online"
   name: "${task_name}_${exp_name}_Agent${agent_id}"
   tags: ["${name}", "${task_name}", "${exp_name}", "Agent${agent_id}"]

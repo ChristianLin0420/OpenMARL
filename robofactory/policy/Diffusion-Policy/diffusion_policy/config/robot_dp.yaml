@@ -78,15 +78,15 @@ ema:
   max_value: 0.9999
 
 dataloader:
-  batch_size: 8
-  num_workers: 0
+  batch_size: 64
+  num_workers: 8
   shuffle: True
   pin_memory: True
   persistent_workers: True
 
 val_dataloader:
-  batch_size: 8
-  num_workers: 0
+  batch_size: 64
+  num_workers: 8
   shuffle: False
   pin_memory: True
   persistent_workers: False
@@ -133,7 +133,7 @@ training:
   eval_sim_max_steps: 200         # Max steps per episode
 
 logging:
-  project: "test"
+  project: "openmarl"
   resume: True
   mode: online
   name: "${task_name}_${exp_name}_Agent${agent_id}"
