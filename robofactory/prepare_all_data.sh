@@ -433,28 +433,16 @@ prepare_task_data() {
             local zarr_path="data/zarr_data/${task_name}_Agent${agent_id}_${NUM_EPISODES}.zarr"
             if [ -d "$zarr_path" ]; then
                 if python -c "
-from robofactory.policy.OpenVLA.openvla_policy.utils.data_conversion import convert_zarr_to_rlds, create_dataset_statistics
+from robofactory.dataset.converters import convert_zarr_to_rlds
+from robofactory.dataset.converters.zarr_to_rlds import create_dataset_statistics
+from robofactory.policy.shared import get_task_instruction
 import os
-
-# Task instructions mapping
-TASK_INSTRUCTIONS = {
-    'LiftBarrier-rf': 'Lift the barrier together with the other robot',
-    'TwoRobotsStackCube-rf': 'Stack the cubes together with the other robot',
-    'ThreeRobotsStackCube-rf': 'Stack the cubes together with the other robots',
-    'CameraAlignment-rf': 'Align the camera with the target object',
-    'LongPipelineDelivery-rf': 'Pass the object along the robot chain',
-    'TakePhoto-rf': 'Take a photo of the target object',
-    'PassShoe-rf': 'Pass the shoe to the other robot',
-    'PlaceFood-rf': 'Place the food on the plate',
-    'StackCube-rf': 'Stack the cube on top of the other cube',
-    'StrikeCube-rf': 'Strike the cube to the target location',
-    'PickMeat-rf': 'Pick up the meat from the grill',
-}
 
 task_name = '$task_name'
 agent_id = $agent_id
 zarr_path = '$zarr_path'
-instruction = TASK_INSTRUCTIONS.get(task_name, 'Complete the task')
+# Use shared task instructions
+instruction = get_task_instruction(task_name, policy_type='simple')
 
 output_path = convert_zarr_to_rlds(
     zarr_path=zarr_path,
@@ -488,27 +476,15 @@ print(f'RLDS conversion successful: {output_path}')
         log "    Global: ${GREEN}[SKIP]${NC} RLDS data already exists"
     elif [ -d "$global_zarr_path" ]; then
         if python -c "
-from robofactory.policy.OpenVLA.openvla_policy.utils.data_conversion import convert_zarr_to_rlds_global, create_dataset_statistics
+from robofactory.dataset.converters import convert_zarr_to_rlds_global
+from robofactory.dataset.converters.zarr_to_rlds import create_dataset_statistics
+from robofactory.policy.shared import get_task_instruction
 import os
-
-# Task instructions mapping
-TASK_INSTRUCTIONS = {
-    'LiftBarrier-rf': 'Observe the multi-robot task from global view',
-    'TwoRobotsStackCube-rf': 'Observe the cube stacking task from global view',
-    'ThreeRobotsStackCube-rf': 'Observe the cube stacking task from global view',
-    'CameraAlignment-rf': 'Observe the camera alignment task from global view',
-    'LongPipelineDelivery-rf': 'Observe the delivery task from global view',
-    'TakePhoto-rf': 'Observe the photo taking task from global view',
-    'PassShoe-rf': 'Observe the shoe passing task from global view',
-    'PlaceFood-rf': 'Observe the food placement task from global view',
-    'StackCube-rf': 'Observe the cube stacking task from global view',
-    'StrikeCube-rf': 'Observe the cube striking task from global view',
-    'PickMeat-rf': 'Observe the meat picking task from global view',
-}
 
 task_name = '$task_name'
 zarr_path = '$global_zarr_path'
-instruction = TASK_INSTRUCTIONS.get(task_name, 'Observe the task from global view')
+# Use shared task instructions (global view)
+instruction = get_task_instruction(task_name, is_global_view=True)
 
 output_path = convert_zarr_to_rlds_global(
     zarr_path=zarr_path,
@@ -553,19 +529,19 @@ print(f'RLDS conversion successful: {output_path}')
             local global_zarr_path="data/zarr_data/${task_name}_global_${NUM_EPISODES}.zarr"
             
             if [ -d "$zarr_path" ]; then
-                # Build command with optional global ZARR path
-                local cmd_args="--zarr_path=robofactory/$zarr_path --output_dir=robofactory/data/lerobot_data --task_name=$task_name --agent_id=$agent_id --num_episodes=$NUM_EPISODES"
+                # Build command arguments
+                local cmd_args="--input robofactory/$zarr_path --output robofactory/data/lerobot_data --format lerobot --task $task_name --agent_id $agent_id --num_episodes $NUM_EPISODES"
                 
                 # Add global ZARR path if it exists
                 if [ -d "$global_zarr_path" ]; then
                     log "    Agent $agent_id: Found global ZARR at $global_zarr_path"
-                    cmd_args="$cmd_args --global_zarr_path=robofactory/$global_zarr_path"
+                    cmd_args="$cmd_args --global_zarr robofactory/$global_zarr_path"
                 else
                     log "    Agent $agent_id: No global ZARR found, will auto-detect"
                 fi
                 
-                # Execute from OpenMARL root to handle imports correctly
-                if cd .. && PYTHONPATH=/workspace/OpenMARL python /workspace/OpenMARL/robofactory/policy/Pi0/pi0_policy/utils/data_conversion.py $cmd_args; then
+                # Execute from OpenMARL root using the new unified converter
+                if cd .. && PYTHONPATH=/workspace/OpenMARL python -m robofactory.dataset.scripts.convert_data $cmd_args; then
                     log "    Agent $agent_id: ✓ ZARR to LeRobot conversion completed (with global view)"
                     lerobot_converted=$((lerobot_converted + 1))
                     cd robofactory

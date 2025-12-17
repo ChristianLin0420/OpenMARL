@@ -2,24 +2,35 @@
 Pi0/Pi0.5 policy interface for RoboFactory evaluation.
 
 This module provides the policy interface that connects to RoboFactory's
-evaluation pipeline, similar to OpenVLA's policy interface.
+evaluation pipeline. Inherits from the core BaseVLAPolicy for interface
+consistency across all VLA policy implementations.
 """
 
 import torch
 import numpy as np
 from pathlib import Path
-from typing import Dict, Optional, List, Any
+from typing import Dict, Optional
 from omegaconf import OmegaConf
 
 from .model.pi0_wrapper import Pi0Model
-from .utils.task_instructions import get_task_instruction
+
+# Import core base class and shared utilities
+from robofactory.policy.core import BaseVLAPolicy
+from robofactory.policy.shared import get_task_instruction
 
 
-class Pi0Policy:
+class Pi0Policy(BaseVLAPolicy):
     """
     Pi0/Pi0.5 policy for RoboFactory evaluation.
     
     Provides a simple interface for action prediction during rollouts.
+    Inherits from BaseVLAPolicy for consistent interface across VLA policies.
+    
+    Attributes:
+        model: Pi0Model instance
+        cfg: Configuration object
+        language_instruction: Current language instruction
+        action_horizon: Number of actions predicted at once
     """
     
     def __init__(
@@ -28,6 +39,7 @@ class Pi0Policy:
         config_path: Optional[str] = None,
         task_name: Optional[str] = None,
         device: str = "cuda:0",
+        action_dim: int = 8,
     ):
         """
         Initialize policy from checkpoint.
@@ -37,10 +49,12 @@ class Pi0Policy:
             config_path: Path to config YAML (optional, will try to infer)
             task_name: Task name for language instruction
             device: Device to run inference on
+            action_dim: Dimension of action space
         """
+        super().__init__(device=device, action_dim=action_dim)
+        
         self.checkpoint_path = Path(checkpoint_path)
         self.task_name = task_name
-        self.device = device
         
         # Load config
         if config_path is None:
@@ -71,15 +85,18 @@ class Pi0Policy:
             use_gradient_checkpointing=False,  # Disable for inference
         )
         
+        # Store action horizon for action chunking
+        self.action_horizon = self.cfg.model.action_horizon
+        
         # Load checkpoint weights
         self._load_checkpoint()
         
         # Set to eval mode
         self.model.eval()
         
-        # Get language instruction
+        # Get language instruction using shared utilities
         if task_name:
-            self.language_instruction = get_task_instruction(task_name)
+            self.language_instruction = get_task_instruction(task_name, policy_type='pi0')
         else:
             self.language_instruction = "Complete the task"
         
@@ -96,7 +113,8 @@ class Pi0Policy:
         
         import safetensors.torch
         state_dict = safetensors.torch.load_file(model_file, device='cpu')
-        self.model.model.load_state_dict(state_dict)
+        # Use strict=False because PaLI-Gemma has tied weights (embed_tokens shares with lm_head)
+        self.model.model.load_state_dict(state_dict, strict=False)
         
         print(f"Loaded model weights from {model_file}")
         
@@ -191,4 +209,42 @@ class Pi0Policy:
     def __call__(self, observation: Dict[str, np.ndarray]) -> np.ndarray:
         """Callable interface for compatibility."""
         return self.predict_action(observation)
+    
+    def set_instruction(self, instruction: str):
+        """
+        Set language instruction.
+        
+        Args:
+            instruction: New language instruction
+        """
+        self.language_instruction = instruction
+    
+    @classmethod
+    def from_checkpoint(
+        cls,
+        checkpoint_path: str,
+        device: str = "cuda:0",
+        task_name: Optional[str] = None,
+        **kwargs,
+    ) -> 'Pi0Policy':
+        """
+        Load policy from checkpoint.
+        
+        Factory method for VLA interface compatibility.
+        
+        Args:
+            checkpoint_path: Path to checkpoint directory
+            device: Device to load model on
+            task_name: Optional task name for instruction
+            **kwargs: Additional arguments
+            
+        Returns:
+            Loaded Pi0Policy instance
+        """
+        return cls(
+            checkpoint_path=checkpoint_path,
+            device=device,
+            task_name=task_name,
+            **kwargs,
+        )
 

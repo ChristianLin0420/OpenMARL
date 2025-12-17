@@ -1,10 +1,12 @@
 """Dataset module for OpenVLA."""
 
-from .base_dataset import BaseVLADataset
+# Import BaseVLADataset from core (shared across all policies)
+from robofactory.policy.core import BaseVLADataset
+
+# Import OpenVLA-specific dataset
 from .robot_rlds_dataset import RobotRLDSDataset
 
 __all__ = [
     "BaseVLADataset",
     "RobotRLDSDataset",
 ]
-

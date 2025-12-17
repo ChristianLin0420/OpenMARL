@@ -4,7 +4,7 @@ robofactory/assets/*
 robofactory/demos/
 assets/*
 robofactory/demos*
-robofactory/data*
+robofactory/data
 robofactory/eval_video
 robofactory/checkpoints
 

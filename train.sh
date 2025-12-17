@@ -150,7 +150,12 @@ train_diffusion_policy() {
     fi
     
     local exp_name="diffusion_policy"
-    local batch_size=${BATCH_SIZE:-64}
+    
+    # Build batch_size argument only if explicitly provided (respect config defaults)
+    local batch_size_arg=""
+    if [[ -n "$BATCH_SIZE" ]]; then
+        batch_size_arg="dataloader.batch_size=${BATCH_SIZE} task.dataset.batch_size=${BATCH_SIZE}"
+    fi
     
     cd robofactory
     
@@ -165,10 +170,10 @@ train_diffusion_policy() {
             training.debug=${DEBUG} \
             training.seed=${SEED} \
             training.device="cuda:0" \
-            dataloader.batch_size=${batch_size} \
             agent_id=${agent_id} \
             exp_name=${exp_name} \
-            logging.mode=${WANDB_MODE}
+            logging.mode=${WANDB_MODE} \
+            ${batch_size_arg}
     else
         # Single GPU training
         export CUDA_VISIBLE_DEVICES=0
@@ -179,10 +184,10 @@ train_diffusion_policy() {
             training.debug=${DEBUG} \
             training.seed=${SEED} \
             training.device="cuda:0" \
-            dataloader.batch_size=${batch_size} \
             agent_id=${agent_id} \
             exp_name=${exp_name} \
-            logging.mode=${WANDB_MODE}
+            logging.mode=${WANDB_MODE} \
+            ${batch_size_arg}
     fi
     
     cd ..

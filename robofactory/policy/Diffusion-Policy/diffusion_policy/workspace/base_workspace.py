@@ -1,7 +1,15 @@
+"""
+Base workspace for Diffusion-Policy training.
+
+This module provides the base workspace class with checkpoint save/load
+functionality. For more comprehensive training functionality, consider
+using robofactory.policy.core.BaseVLAWorkspace.
+
+The original BaseWorkspace is preserved for backward compatibility.
+"""
+
 from typing import Optional
-import os
 import pathlib
-import hydra
 import copy
 from hydra.core.hydra_config import HydraConfig
 from omegaconf import OmegaConf
@@ -11,10 +19,32 @@ import threading
 
 
 class BaseWorkspace:
+    """
+    Base workspace class for Diffusion-Policy.
+    
+    Provides checkpoint save/load functionality and Hydra integration.
+    For full training loop implementation, see DiffusionPolicyWorkspace
+    or use the core.BaseVLAWorkspace.
+    
+    This class is maintained for backward compatibility with existing
+    Diffusion-Policy configurations and checkpoints.
+    
+    Attributes:
+        cfg: OmegaConf configuration object
+        include_keys: Keys to include when saving pickles
+        exclude_keys: Keys to exclude from state_dict saving
+    """
     include_keys = tuple()
     exclude_keys = tuple()
 
     def __init__(self, cfg: OmegaConf, output_dir: Optional[str]=None):
+        """
+        Initialize workspace.
+        
+        Args:
+            cfg: Hydra/OmegaConf configuration
+            output_dir: Output directory (uses Hydra default if None)
+        """
         self.cfg = cfg
         self._output_dir = output_dir
         self._saving_thread = None

@@ -25,7 +25,8 @@ from robofactory.utils.wrappers.record import RecordEpisodeMA
 from robofactory.planner.motionplanner import PandaArmMotionPlanningSolver
 
 from openvla_policy.policy.openvla_policy import OpenVLAPolicy
-from openvla_policy.utils.task_instructions import get_task_instruction
+from robofactory.policy.shared import get_task_instruction
+from robofactory.policy.shared.evaluation import BasePolicyWrapper
 
 
 def parse_args():
@@ -132,12 +133,19 @@ def load_task_instruction(task_name: str) -> str:
     return get_task_instruction(task_name)
 
 
-class OpenVLAPolicyWrapper:
-    """Wrapper for OpenVLA policy to match DP interface."""
+class OpenVLAPolicyWrapper(BasePolicyWrapper):
+    """Wrapper for OpenVLA policy to match evaluation interface."""
     
     def __init__(self, task_name: str, checkpoint_num: int, data_num: int, agent_id: int = 0):
         """Initialize policy wrapper."""
-        # Load checkpoint
+        # Initialize base class
+        super().__init__(task_name=task_name, device='cuda:0')
+        
+        self.checkpoint_num = checkpoint_num
+        self.data_num = data_num
+        self.agent_id = agent_id
+        
+        # Build checkpoint path
         checkpoint_dir = f'checkpoints/{task_name}_Agent{agent_id}_{data_num}/epoch_{checkpoint_num}'
         
         if not Path(checkpoint_dir).exists():
@@ -152,24 +160,21 @@ class OpenVLAPolicyWrapper:
         else:
             stats = None
         
-        # Create policy
-        self.policy = OpenVLAPolicy(
-            checkpoint_path=checkpoint_dir,
-            device='cuda:0',
-            action_statistics=stats.get('action') if stats else None
-        )
+        # Load policy
+        self.load_policy(checkpoint_dir, action_statistics=stats.get('action') if stats else None)
         
         # Get instruction
         self.instruction = load_task_instruction(task_name)
         
-        # Observation buffer (for compatibility)
-        self.obs_buffer = []
+    def load_policy(self, checkpoint_path: str, **kwargs):
+        """Load policy from checkpoint."""
+        action_statistics = kwargs.get('action_statistics')
         
-    def update_obs(self, observation):
-        """Update observation buffer."""
-        self.obs_buffer.append(observation)
-        if len(self.obs_buffer) > 3:
-            self.obs_buffer.pop(0)
+        self.policy = OpenVLAPolicy(
+            checkpoint_path=checkpoint_path,
+            device=self.device,
+            action_statistics=action_statistics
+        )
     
     def get_action(self, observation=None):
         """Get action from policy."""
@@ -181,10 +186,6 @@ class OpenVLAPolicyWrapper:
         
         # Return as list of actions (for compatibility with multi-step execution)
         return [action for _ in range(6)]
-    
-    def get_last_obs(self):
-        """Get last observation."""
-        return self.obs_buffer[-1] if self.obs_buffer else None
 
 
 def main(args):

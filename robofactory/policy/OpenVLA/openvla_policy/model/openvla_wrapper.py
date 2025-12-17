@@ -4,13 +4,10 @@ import os
 from typing import Dict, Optional, Tuple, List, Union
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from transformers import AutoModelForVision2Seq, AutoProcessor
 from peft import LoraConfig, get_peft_model, PeftModel
 from PIL import Image
 import numpy as np
-import torchvision.transforms.functional as TF
-import wandb
 
 
 # OpenVLA action tokenization constants
@@ -624,9 +621,6 @@ class OpenVLAModel(nn.Module):
             import json
             with open(os.path.join(save_directory, 'action_stats.json'), 'w') as f:
                 json.dump(stats, f)
-        
-        if self._is_logging_rank:
-            print(f"Model saved to {save_directory}")
     
     @classmethod
     def from_pretrained(

@@ -4,6 +4,10 @@ Diffusion Policy training workspace with DDP and enhanced logging support.
 This module implements the training loop for Diffusion Policy models using PyTorch DDP
 for distributed training across multiple GPUs, with comprehensive wandb logging
 aligned with OpenVLA patterns.
+
+Now inherits from BaseVLAWorkspace for consistent behavior across all policies
+while maintaining full backward compatibility with existing Diffusion-Policy
+training scripts and checkpoints.
 """
 
 if __name__ == "__main__":
@@ -18,96 +22,44 @@ if __name__ == "__main__":
 import os
 import hydra
 import torch
+import torch.nn as nn
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data import DataLoader
-from torch.utils.data.distributed import DistributedSampler
+from torch.utils.data import DataLoader, Dataset
 from omegaconf import OmegaConf
 import pathlib
 import copy
 import random
+import dill
+import threading
 import tqdm
 import numpy as np
-from typing import Dict, Any, Optional
-from diffusion_policy.workspace.base_workspace import BaseWorkspace
+from typing import Dict, Any, Tuple
 from diffusion_policy.policy.diffusion_unet_image_policy import DiffusionUnetImagePolicy
 from diffusion_policy.dataset.base_dataset import BaseImageDataset
 from diffusion_policy.common.checkpoint_util import TopKCheckpointManager
 from diffusion_policy.common.json_logger import JsonLogger
-from diffusion_policy.common.pytorch_util import dict_apply, optimizer_to
+from diffusion_policy.common.pytorch_util import optimizer_to
 from diffusion_policy.model.diffusion.ema_model import EMAModel
 from diffusion_policy.model.common.lr_scheduler import get_scheduler
 import wandb
 
+# Import base workspace and shared utilities
+from robofactory.policy.core import (
+    BaseVLAWorkspace,
+    setup_distributed,
+    cleanup_distributed,
+    is_main_process,
+    get_rank,
+    get_world_size,
+)
+
 OmegaConf.register_new_resolver("eval", eval, replace=True)
 
 
-# ============================================================================
-# Distributed Training Utilities
-# ============================================================================
-
 def is_distributed():
-    """Check if running in distributed mode."""
+    """Check if running in distributed mode - wrapper for backward compatibility."""
     return dist.is_available() and dist.is_initialized()
-
-
-def get_rank():
-    """Get current process rank."""
-    if is_distributed():
-        return dist.get_rank()
-    return 0
-
-
-def get_world_size():
-    """Get total number of processes."""
-    if is_distributed():
-        return dist.get_world_size()
-    return 1
-
-
-def is_main_process():
-    """Check if this is the main process (rank 0)."""
-    return get_rank() == 0
-
-
-def setup_distributed():
-    """Initialize distributed training if launched with torchrun."""
-    if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
-        rank = int(os.environ['RANK'])
-        world_size = int(os.environ['WORLD_SIZE'])
-        local_rank = int(os.environ.get('LOCAL_RANK', 0))
-        
-        # Initialize process group
-        dist.init_process_group(
-            backend='nccl',
-            init_method='env://',
-            world_size=world_size,
-            rank=rank
-        )
-        
-        # Set device for this process
-        torch.cuda.set_device(local_rank)
-        
-        print(f"[Rank {rank}/{world_size}] Initialized distributed training on GPU {local_rank}")
-        return True, local_rank
-    return False, 0
-
-
-def cleanup_distributed():
-    """Clean up distributed training."""
-    if is_distributed():
-        dist.destroy_process_group()
-
-
-def reduce_tensor(tensor):
-    """Reduce tensor across all processes."""
-    if not is_distributed():
-        return tensor
-    
-    rt = tensor.clone()
-    dist.all_reduce(rt, op=dist.ReduceOp.SUM)
-    rt /= get_world_size()
-    return rt
 
 
 # ============================================================================
@@ -172,7 +124,16 @@ class BatchSampler:
         self.num_batch = data_size // batch_size
         self.discard = data_size - batch_size * self.num_batch
         self.shuffle = shuffle
+        self.seed = seed
+        self.epoch = 0
         self.rng = np.random.default_rng(seed) if shuffle else None
+
+    def set_epoch(self, epoch: int):
+        """Set epoch for shuffling (for API compatibility with DistributedBatchSampler)."""
+        self.epoch = epoch
+        # Update RNG with epoch-dependent seed for better shuffling each epoch
+        if self.shuffle:
+            self.rng = np.random.default_rng(self.seed + epoch)
 
     def __iter__(self):
         if self.shuffle:
@@ -193,13 +154,20 @@ class BatchSampler:
 # RobotWorkspace with DDP Support and Enhanced Logging
 # ============================================================================
 
-class RobotWorkspace(BaseWorkspace):
+class RobotWorkspace(BaseVLAWorkspace):
     """
     Training workspace for Diffusion Policy models.
     
+    Inherits from BaseVLAWorkspace and implements Diffusion-Policy-specific:
+    - Model initialization via Hydra
+    - EMA model support
+    - U-Net based diffusion policy
+    - Custom batch samplers
+    - Simulation evaluation
+    
     Features:
     - Multi-GPU training with DDP
-    - Comprehensive wandb logging (aligned with OpenVLA)
+    - Comprehensive wandb logging (aligned with OpenVLA/Pi0)
     - Gradient norm tracking
     - Loss statistics
     - Visual logging (observations, action predictions)
@@ -208,14 +176,23 @@ class RobotWorkspace(BaseWorkspace):
     """
     
     include_keys = ['global_step', 'epoch', 'wandb_run_id']
-
+    exclude_keys = tuple()  # For checkpoint compatibility
+    
     def __init__(self, cfg: OmegaConf, output_dir=None):
-        super().__init__(cfg, output_dir=output_dir)
+        # Note: Don't call super().__init__() as we override most functionality
+        # but keep the interface compatible
+        self.cfg = cfg
+        self._output_dir = output_dir
+        self._saving_thread = None
         
         # Setup distributed training if available
-        self.distributed, self.local_rank = setup_distributed()
+        self.distributed, self.local_rank, _ = setup_distributed()
         self.rank = get_rank()
         self.world_size = get_world_size()
+        
+        # Set instance variables for BaseVLAWorkspace compatibility
+        self.device = torch.device(f'cuda:{self.local_rank}') if self.distributed else torch.device(cfg.training.device)
+        self._is_main_process = is_main_process()
         
         # Set seed (different seed per rank for data augmentation diversity)
         seed = cfg.training.seed + self.rank
@@ -254,6 +231,123 @@ class RobotWorkspace(BaseWorkspace):
         project_root = pathlib.Path(__file__).resolve().parents[4]
         zarr_stem = pathlib.Path(cfg.task.dataset.zarr_path).stem  # e.g., "PassShoe-rf_Agent0_160"
         self.checkpoint_base_dir = project_root / "checkpoints" / f"{cfg.exp_name}" / zarr_stem
+    
+    # =========================================================================
+    # Property for output_dir (from original BaseWorkspace)
+    # =========================================================================
+    
+    @property
+    def output_dir(self):
+        from hydra.core.hydra_config import HydraConfig
+        output_dir = self._output_dir
+        if output_dir is None:
+            output_dir = HydraConfig.get().runtime.output_dir
+        return output_dir
+    
+    # =========================================================================
+    # Abstract method implementations for BaseVLAWorkspace interface
+    # =========================================================================
+    
+    def _get_checkpoint_dir(self) -> pathlib.Path:
+        """Get checkpoint directory for Diffusion Policy."""
+        return self.checkpoint_base_dir
+    
+    def _init_model(self) -> nn.Module:
+        """Initialize Diffusion Policy model via Hydra."""
+        # Model is already initialized in __init__ via Hydra
+        return self.model
+    
+    def _init_dataset(self) -> Tuple[Dataset, Dataset]:
+        """Initialize datasets via Hydra."""
+        cfg = self.cfg
+        dataset = hydra.utils.instantiate(cfg.task.dataset)
+        val_dataset = dataset.get_validation_dataset()
+        return dataset, val_dataset
+    
+    def _compute_loss(self, batch: Dict[str, Any]) -> torch.Tensor:
+        """Compute diffusion policy loss."""
+        # The model's compute_loss is called in the training loop
+        raw_loss = self.model.compute_loss(batch)
+        loss = raw_loss.mean()
+        return loss
+    
+    # =========================================================================
+    # Checkpoint save/load (from original BaseWorkspace for compatibility)
+    # =========================================================================
+    
+    def save_checkpoint(self, path=None, tag='latest', 
+            exclude_keys=None, include_keys=None, use_thread=True):
+        """Save checkpoint with full training state."""
+        if path is None:
+            path = pathlib.Path(self.output_dir).joinpath('checkpoints', f'{tag}.ckpt')
+        else:
+            path = pathlib.Path(path)
+        if exclude_keys is None:
+            exclude_keys = tuple(self.exclude_keys)
+        if include_keys is None:
+            include_keys = tuple(self.include_keys) + ('_output_dir',)
+
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            'cfg': self.cfg,
+            'state_dicts': dict(),
+            'pickles': dict()
+        } 
+
+        for key, value in self.__dict__.items():
+            if hasattr(value, 'state_dict') and hasattr(value, 'load_state_dict'):
+                if key not in exclude_keys:
+                    if use_thread:
+                        payload['state_dicts'][key] = _copy_to_cpu(value.state_dict())
+                    else:
+                        payload['state_dicts'][key] = value.state_dict()
+            elif key in include_keys:
+                payload['pickles'][key] = dill.dumps(value)
+        
+        if use_thread:
+            self._saving_thread = threading.Thread(
+                target=lambda: torch.save(payload, path.open('wb'), pickle_module=dill))
+            self._saving_thread.start()
+        else:
+            torch.save(payload, path.open('wb'), pickle_module=dill)
+        return str(path.absolute())
+    
+    def get_checkpoint_path(self, tag='latest'):
+        return pathlib.Path(self.output_dir).joinpath('checkpoints', f'{tag}.ckpt')
+
+    def load_payload(self, payload, exclude_keys=None, include_keys=None, **kwargs):
+        if exclude_keys is None:
+            exclude_keys = tuple()
+        if include_keys is None:
+            include_keys = payload['pickles'].keys()
+
+        for key, value in payload['state_dicts'].items():
+            if key not in exclude_keys:
+                self.__dict__[key].load_state_dict(value, **kwargs)
+        for key in include_keys:
+            if key in payload['pickles']:
+                self.__dict__[key] = dill.loads(payload['pickles'][key])
+    
+    def load_checkpoint(self, path=None, tag='latest',
+            exclude_keys=None, include_keys=None, **kwargs):
+        if path is None:
+            path = self.get_checkpoint_path(tag=tag)
+        else:
+            path = pathlib.Path(path)
+        payload = torch.load(path.open('rb'), pickle_module=dill, **kwargs)
+        self.load_payload(payload, exclude_keys=exclude_keys, include_keys=include_keys)
+        return payload
+    
+    @classmethod
+    def create_from_checkpoint(cls, path, exclude_keys=None, include_keys=None, **kwargs):
+        payload = torch.load(open(path, 'rb'), pickle_module=dill)
+        instance = cls(payload['cfg'])
+        instance.load_payload(payload, exclude_keys=exclude_keys, include_keys=include_keys, **kwargs)
+        return instance
+
+    # =========================================================================
+    # Checkpoint discovery methods
+    # =========================================================================
 
     def get_latest_checkpoint_path(self):
         """Find the checkpoint with the highest epoch number in the deterministic checkpoint dir."""
@@ -262,18 +356,23 @@ class RobotWorkspace(BaseWorkspace):
         if not ckpt_dir.exists():
             return None
         
-        # Find all numbered checkpoint files
+        # Find all numbered checkpoint files (supports both epoch_{N}.ckpt and {N}.ckpt formats)
         max_epoch = -1
         best_ckpt = None
         
         for ckpt_file in ckpt_dir.glob('*.ckpt'):
-            name = ckpt_file.stem  # e.g., "100", "200", "best"
+            name = ckpt_file.stem  # e.g., "epoch_100", "100", "best"
             try:
-                epoch = int(name)
+                # Try new format: epoch_{N}
+                if name.startswith('epoch_'):
+                    epoch = int(name.split('_')[1])
+                else:
+                    # Legacy format: {N}
+                    epoch = int(name)
                 if epoch > max_epoch:
                     max_epoch = epoch
                     best_ckpt = ckpt_file
-            except ValueError:
+            except (ValueError, IndexError):
                 # Not a numbered checkpoint (e.g., "best"), skip
                 pass
         
@@ -880,6 +979,14 @@ class RobotWorkspace(BaseWorkspace):
     def run(self):
         cfg = copy.deepcopy(self.cfg)
 
+        # Print config at start (aligned with Pi0/OpenVLA - using OmegaConf)
+        if is_main_process():
+            print("="*80)
+            print("Initializing Diffusion Policy Training")
+            print("="*80)
+            print(OmegaConf.to_yaml(cfg))
+            print("="*80)
+        
         # Resume training - automatically find highest numbered checkpoint
         if cfg.training.resume:
             latest_ckpt_path = self.get_latest_checkpoint_path()
@@ -888,15 +995,19 @@ class RobotWorkspace(BaseWorkspace):
                     print(f"Resuming from checkpoint {latest_ckpt_path}")
                 self.load_checkpoint(path=latest_ckpt_path)
                 
-                # Use checkpoint filename to determine completed epochs (backward compatibility)
-                # e.g., "500.ckpt" means 500 epochs completed, start from 500
+                # Use checkpoint filename to determine completed epochs
+                # Supports both epoch_{N}.ckpt and {N}.ckpt formats
                 try:
-                    completed_epochs = int(latest_ckpt_path.stem)
+                    name = latest_ckpt_path.stem
+                    if name.startswith('epoch_'):
+                        completed_epochs = int(name.split('_')[1])
+                    else:
+                        completed_epochs = int(name)
                     if self.epoch < completed_epochs:
                         if is_main_process():
                             print(f"Adjusting epoch from {self.epoch} to {completed_epochs} (from checkpoint name)")
                         self.epoch = completed_epochs
-                except ValueError:
+                except (ValueError, IndexError):
                     pass  # Not a numbered checkpoint (e.g., "best.ckpt")
             else:
                 if is_main_process():
@@ -1264,7 +1375,8 @@ class RobotWorkspace(BaseWorkspace):
                 # Checkpoint (only on main process) - now self.epoch is already incremented
                 if is_main_process() and (self.epoch % cfg.training.checkpoint_every) == 0:
                     save_name = pathlib.Path(self.cfg.task.dataset.zarr_path).stem
-                    self.save_checkpoint(f'checkpoints/{self.cfg.exp_name}/{save_name}/{self.epoch}.ckpt')
+                    ckpt_path = f'checkpoints/{self.cfg.exp_name}/{save_name}/epoch_{self.epoch}.ckpt'
+                    self.save_checkpoint(ckpt_path)
                 
                 # Synchronize all processes before next epoch
                 if self.distributed:
@@ -1273,6 +1385,19 @@ class RobotWorkspace(BaseWorkspace):
                 # ========= eval end for this epoch ==========
                 policy.train()
 
+            # Save final checkpoint if not already saved
+            if is_main_process():
+                save_name = pathlib.Path(self.cfg.task.dataset.zarr_path).stem
+                final_ckpt_path = f'checkpoints/{self.cfg.exp_name}/{save_name}/epoch_{self.epoch}.ckpt'
+                # Check if the final epoch checkpoint already exists
+                if not pathlib.Path(final_ckpt_path).exists():
+                    self.save_checkpoint(final_ckpt_path)
+                    print(f"Saved final checkpoint at epoch_{self.epoch} (step {self.global_step}) -> {final_ckpt_path}")
+                
+                print("="*80)
+                print("Training completed!")
+                print("="*80)
+            
             # Final summary (aligned with OpenVLA)
             if is_main_process():
                 if cfg.logging.mode == "online":
@@ -1357,6 +1482,21 @@ def create_dataloader(dataset, *, batch_size: int, shuffle: bool, num_workers: i
         persistent_workers=persistent_workers
     )
     return dataloader
+
+
+def _copy_to_cpu(x):
+    """Helper function for checkpoint saving - copy tensors to CPU."""
+    if isinstance(x, torch.Tensor):
+        return x.detach().to('cpu')
+    elif isinstance(x, dict):
+        result = dict()
+        for k, v in x.items():
+            result[k] = _copy_to_cpu(v)
+        return result
+    elif isinstance(x, list):
+        return [_copy_to_cpu(k) for k in x]
+    else:
+        return copy.deepcopy(x)
 
 
 @hydra.main(

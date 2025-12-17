@@ -26,7 +26,8 @@ from robofactory.utils.wrappers.record import RecordEpisodeMA
 from robofactory.planner.motionplanner import PandaArmMotionPlanningSolver
 
 from pi0_policy.policy.pi0_policy import Pi0Policy
-from pi0_policy.utils.task_instructions import get_task_instruction
+from robofactory.policy.shared import get_task_instruction
+from robofactory.policy.shared.evaluation import ActionChunkingWrapper
 
 
 def parse_args():
@@ -173,7 +174,7 @@ def load_task_instruction(task_name: str) -> str:
     return get_task_instruction(task_name)
 
 
-class Pi0PolicyWrapper:
+class Pi0PolicyWrapper(ActionChunkingWrapper):
     """Wrapper for Pi0 policy to match evaluation interface."""
     
     def __init__(
@@ -186,7 +187,28 @@ class Pi0PolicyWrapper:
         device: str = 'cuda:0'
     ):
         """Initialize policy wrapper."""
-        # Construct checkpoint path
+        # Initialize base class
+        super().__init__(
+            task_name=task_name,
+            device=device,
+            action_horizon=50,  # Default, will be updated after loading policy
+            action_repeat=6,
+        )
+        
+        self.checkpoint_step = checkpoint_step
+        self.data_num = data_num
+        self.agent_id = agent_id
+        self.policy_type = policy_type
+        
+        # Find and load checkpoint
+        checkpoint_dir = self._find_checkpoint_dir(checkpoint_step)
+        self.load_policy(str(checkpoint_dir))
+        
+        print(f"Initialized {policy_type} policy for {task_name} (Agent {agent_id})")
+        print(f"Action horizon: {self.action_horizon}")
+    
+    def _find_checkpoint_dir(self, checkpoint_step: int) -> Path:
+        """Find checkpoint directory."""
         checkpoint_dir = Path(f'data/outputs') / 'checkpoints' / str(checkpoint_step)
         
         # Try to find checkpoint in nested structure
@@ -208,62 +230,25 @@ class Pi0PolicyWrapper:
         if not checkpoint_dir.exists():
             raise FileNotFoundError(f"Checkpoint not found at step {checkpoint_step}")
         
-        print(f"Loading Pi0 checkpoint from {checkpoint_dir}")
+        return checkpoint_dir
+    
+    def load_policy(self, checkpoint_path: str, **kwargs):
+        """Load policy from checkpoint."""
+        print(f"Loading Pi0 checkpoint from {checkpoint_path}")
         
         # Create policy
         self.policy = Pi0Policy(
-            checkpoint_path=str(checkpoint_dir),
-            task_name=task_name,
-            device=device,
+            checkpoint_path=checkpoint_path,
+            task_name=self.task_name,
+            device=self.device,
         )
         
-        # Action horizon for chunking
+        # Update action horizon from loaded config
         self.action_horizon = self.policy.cfg.model.action_horizon
-        self.action_buffer = []
-        self.action_idx = 0
-        
-        # Observation buffer
-        self.obs_buffer = []
-        
-        print(f"Initialized {policy_type} policy for {task_name} (Agent {agent_id})")
-        print(f"Action horizon: {self.action_horizon}")
-        
-    def update_obs(self, observation):
-        """Update observation buffer."""
-        self.obs_buffer.append(observation)
-        if len(self.obs_buffer) > 3:
-            self.obs_buffer.pop(0)
     
-    def get_action(self, observation=None):
-        """
-        Get action from policy.
-        
-        Pi0 predicts action sequences (action chunking), so we:
-        1. Predict a new sequence when buffer is empty
-        2. Return actions from the buffer one at a time
-        """
-        if observation is None and len(self.obs_buffer) > 0:
-            observation = self.obs_buffer[-1]
-        
-        # Check if we need to predict a new action sequence
-        if len(self.action_buffer) == 0 or self.action_idx >= len(self.action_buffer):
-            # Predict new action sequence
-            action_sequence = self.policy.predict_action(observation)
-            
-            # Store in buffer (action_sequence is [action_horizon, action_dim])
-            self.action_buffer = [action_sequence[i] for i in range(len(action_sequence))]
-            self.action_idx = 0
-        
-        # Get current action from buffer
-        action = self.action_buffer[self.action_idx]
-        self.action_idx += 1
-        
-        # Return as list of repeated actions (for multi-step execution compatibility)
-        return [action for _ in range(6)]
-    
-    def get_last_obs(self):
-        """Get last observation."""
-        return self.obs_buffer[-1] if self.obs_buffer else None
+    def _predict_action_sequence(self, observation):
+        """Predict action sequence from policy."""
+        return self.policy.predict_action(observation)
 
 
 def main(args):

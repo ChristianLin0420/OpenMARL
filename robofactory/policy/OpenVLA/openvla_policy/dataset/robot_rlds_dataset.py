@@ -1,15 +1,13 @@
 """RLDS dataset loader for RoboFactory tasks with OpenVLA - Multi-view support."""
 
 import json
-import os
 from pathlib import Path
 from typing import Dict, Any, Optional, Tuple, List
 import numpy as np
 import torch
-from torch.utils.data import Dataset
 from PIL import Image
 import tensorflow as tf
-from .base_dataset import BaseVLADataset
+from robofactory.policy.core import BaseVLADataset
 
 
 class RobotRLDSDataset(BaseVLADataset):

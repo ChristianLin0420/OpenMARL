@@ -1,7 +1,14 @@
+"""
+Base dataset classes for Diffusion-Policy.
+
+These classes are specific to Diffusion-Policy's normalizer pattern.
+For VLA-style datasets with a more general interface, see:
+    robofactory.policy.core.BaseVLADataset
+"""
+
 from typing import Dict
 
 import torch
-import torch.nn
 from diffusion_policy.model.common.normalizer import LinearNormalizer
 
 class BaseLowdimDataset(torch.utils.data.Dataset):

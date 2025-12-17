@@ -4,26 +4,25 @@ Pi0/Pi0.5 training workspace with multi-GPU support.
 This module implements the training loop for Pi0 models using PyTorch DDP
 for distributed training across multiple GPUs.
 
-Follows openpi's training patterns from scripts/train_pytorch.py:
-- Wandb logging with run ID tracking for resuming
-- Periodic logging every N steps (not every batch)
-- Checkpoint saving following openpi conventions
+Now inherits from BaseVLAWorkspace for consistent behavior across all policies
+while maintaining Pi0-specific features:
+- Safetensors checkpoint format (following openpi)
 - Quantile normalization for actions and states
+- Custom collate function for LeRobot format
+
+Follows openpi's training patterns from scripts/train_pytorch.py.
 """
 
-import os
-import json
+import re
 import time
 import logging
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Tuple
 import numpy as np
 import torch
-import torch.distributed as dist
+import torch.nn as nn
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data import DataLoader, DistributedSampler
-from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.utils.data import Dataset
 import wandb
 from tqdm import tqdm
 from omegaconf import OmegaConf
@@ -31,20 +30,22 @@ from omegaconf import OmegaConf
 from ..model.pi0_wrapper import Pi0Model
 from ..dataset.robot_lerobot_dataset import RobotLeRobotDataset, collate_fn
 
-# Suppress verbose OpenPI logs (e.g., "Resizing image..." on every batch)
+# Import base workspace and shared utilities
+from robofactory.policy.core import BaseVLAWorkspace
+
+# Suppress verbose OpenPI logs
 logging.getLogger("openpi").setLevel(logging.WARNING)
 
 
-class Pi0Workspace:
+class Pi0Workspace(BaseVLAWorkspace):
     """
     Training workspace for Pi0/Pi0.5 models.
     
-    Handles:
-    - Dataset loading (LeRobot format)
-    - Model initialization from pretrained checkpoints
-    - Multi-GPU training with DDP
-    - Wandb logging (following openpi pattern)
-    - Checkpoint saving/loading
+    Inherits from BaseVLAWorkspace and implements Pi0-specific:
+    - Model initialization (PI0Pytorch from openpi)
+    - Dataset loading (LeRobot format with custom collate)
+    - Loss computation (openpi's internal loss)
+    - Checkpoint saving (safetensors format)
     """
     
     def __init__(self, cfg: OmegaConf = None, output_dir: Optional[str] = None, **kwargs):
@@ -54,103 +55,48 @@ class Pi0Workspace:
         Args:
             cfg: Hydra configuration
             output_dir: Output directory for logs and checkpoints
-            **kwargs: Additional arguments from Hydra (ignored, used for config flexibility)
+            **kwargs: Additional arguments from Hydra
         """
-        # If cfg is not passed, reconstruct it from kwargs (Hydra instantiation pattern)
+        # If cfg is not passed, reconstruct it from kwargs
         if cfg is None:
             cfg = OmegaConf.create(kwargs)
-        self.cfg = cfg
         
-        if output_dir is None:
-            output_dir = cfg.hydra.run.dir if hasattr(cfg, 'hydra') else 'outputs'
-        self.output_dir = Path(output_dir)
-        self.output_dir.mkdir(parents=True, exist_ok=True)
+        # Call parent init
+        super().__init__(cfg, output_dir)
         
-        # Initialize distributed training (following openpi pattern)
-        self.use_ddp, self.local_rank, self.device = self._setup_ddp()
-        self.rank = int(os.environ.get("RANK", 0))
-        self.world_size = int(os.environ.get("WORLD_SIZE", 1))
-        self.is_main_process = (not self.use_ddp) or (dist.get_rank() == 0)
-        
-        # Set random seed
-        self._set_seed(cfg.training.seed + self.local_rank)
-        
-        # Training state
-        self.global_step = 0
-        self.epoch = 0
-        self.best_loss = float('inf')
-        
-        # Model and optimizer (will be initialized in run())
-        self.model = None
-        self.optimizer = None
-        self.scheduler = None
-        
-        # For periodic logging (following openpi)
+        # Pi0-specific: For periodic logging (following openpi)
         self.step_infos = []
         self.start_time = time.time()
-        
-        # Checkpoint directory following OpenVLA pattern: robofactory/checkpoints/pi0/{task_name}/
-        self._init_checkpoint_dir()
     
-    def _init_checkpoint_dir(self):
-        """Initialize checkpoint directory following OpenVLA pattern."""
-        # Get task name and agent info from config
-        task_name = self.cfg.task.name if hasattr(self.cfg.task, 'name') else self.cfg.get('task_name', 'unknown')
-        agent_id = self.cfg.get('agent_id', 0)
+    def _get_checkpoint_dir(self) -> Path:
+        """Get Pi0-specific checkpoint directory."""
+        cfg = self.cfg
+        
+        # Get task name and agent info
+        task_name = cfg.task.name if hasattr(cfg.task, 'name') else cfg.get('task_name', 'unknown')
+        agent_id = cfg.get('agent_id', 0)
         
         # Extract data count from lerobot_path if available
         data_count = "150"  # default
-        if hasattr(self.cfg.task, 'lerobot_path'):
-            lerobot_path = self.cfg.task.lerobot_path
-            # Extract number from path like "robofactory/data/lerobot_data/LiftBarrier-rf_Agent0_5"
-            import re
+        if hasattr(cfg.task, 'lerobot_path'):
+            lerobot_path = cfg.task.lerobot_path
             match = re.search(r'_(\d+)$', lerobot_path)
             if match:
                 data_count = match.group(1)
         
         # Model type (pi0 or pi05)
-        model_type = self.cfg.model.get('model_variant', 'pi0')
+        model_type = cfg.model.get('model_variant', 'pi0')
         
-        # Checkpoint directory: robofactory/checkpoints/pi0/{task_name}_Agent{agent_id}_{data_count}/
-        self.checkpoint_dir = Path('robofactory/checkpoints') / model_type / f"{task_name}_Agent{agent_id}_{data_count}"
-        self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
-        
-        if self.is_main_process:
-            print(f"Checkpoint directory: {self.checkpoint_dir}")
+        return Path('robofactory/checkpoints') / model_type / f"{task_name}_Agent{agent_id}_{data_count}"
     
-    def _setup_ddp(self):
-        """Setup DDP (following openpi's setup_ddp)."""
-        world_size = int(os.environ.get("WORLD_SIZE", "1"))
-        use_ddp = world_size > 1
-        
-        if use_ddp and not torch.distributed.is_initialized():
-            backend = "nccl" if torch.cuda.is_available() else "gloo"
-            torch.distributed.init_process_group(backend=backend, init_method="env://")
-            
-            # Set up debugging environment variables
-            if os.environ.get("TORCH_DISTRIBUTED_DEBUG") is None:
-                os.environ["TORCH_DISTRIBUTED_DEBUG"] = "INFO"
-        
-        local_rank = int(os.environ.get("LOCAL_RANK", os.environ.get("RANK", "0")))
-        device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
-        
-        if torch.cuda.is_available():
-            torch.cuda.set_device(device)
-        
-        return use_ddp, local_rank, device
-    
-    def _set_seed(self, seed: int):
-        """Set random seed for reproducibility."""
-        torch.manual_seed(seed)
-        np.random.seed(seed)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(seed)
-    
-    def _init_model(self):
+    def _init_model(self) -> nn.Module:
         """Initialize Pi0 model."""
         cfg = self.cfg
         
-        self.model = Pi0Model(
+        if self._is_main_process:
+            print("Initializing Pi0 model...")
+        
+        model = Pi0Model(
             model_variant=cfg.model.model_variant,
             paligemma_variant=cfg.model.paligemma_variant,
             action_expert_variant=cfg.model.action_expert_variant,
@@ -164,51 +110,19 @@ class Pi0Workspace:
             use_gradient_checkpointing=cfg.model.use_gradient_checkpointing,
         )
         
-        # Wrap with DDP if distributed
-        if self.use_ddp:
-            self.model = DDP(
-                self.model,
-                device_ids=[self.local_rank],
-                output_device=self.local_rank,
-                find_unused_parameters=False,
-            )
+        return model
     
-    def _init_optimizer(self):
-        """Initialize optimizer and scheduler."""
+    def _init_dataset(self) -> Tuple[Dataset, Dataset]:
+        """Create training and validation datasets (LeRobot format)."""
         cfg = self.cfg
         
-        # Get trainable parameters
-        model_for_params = self.model.module if isinstance(self.model, DDP) else self.model
-        params = [p for p in model_for_params.parameters() if p.requires_grad]
-        
-        self.optimizer = AdamW(
-            params,
-            lr=cfg.training.learning_rate,
-            weight_decay=cfg.training.weight_decay,
-            betas=(cfg.training.adam_beta1, cfg.training.adam_beta2),
-            eps=cfg.training.adam_eps,
-        )
-        
-        # Learning rate scheduler
-        if cfg.training.use_scheduler:
-            self.scheduler = CosineAnnealingLR(
-                self.optimizer,
-                T_max=cfg.training.num_epochs,
-                eta_min=cfg.training.min_learning_rate,
-            )
-    
-    def _init_dataloaders(self):
-        """Initialize train and validation dataloaders."""
-        cfg = self.cfg
-        
-        # Get lerobot_path from the correct location (task.lerobot_path, not task.dataset.lerobot_path)
-        # The override from train.sh sets task.lerobot_path
+        # Get lerobot_path from the correct location
         lerobot_path = cfg.task.lerobot_path if hasattr(cfg.task, 'lerobot_path') else cfg.task.dataset.lerobot_path
         
-        if self.is_main_process:
+        if self._is_main_process:
             print(f"Loading LeRobot dataset: {lerobot_path}")
         
-        # Training dataset (LeRobot format)
+        # Training dataset
         train_dataset = RobotLeRobotDataset(
             repo_id=lerobot_path,
             action_horizon=cfg.model.action_horizon,
@@ -227,7 +141,18 @@ class Pi0Workspace:
         )
         
         # Setup normalization statistics (following openpi's quantile normalization)
-        stats = train_dataset.get_statistics()
+        self._setup_normalization(train_dataset)
+        
+        if self._is_main_process:
+            print(f"Created datasets:")
+            print(f"  Train: {len(train_dataset)} samples")
+            print(f"  Val: {len(val_dataset)} samples")
+        
+        return train_dataset, val_dataset
+    
+    def _setup_normalization(self, dataset: RobotLeRobotDataset):
+        """Setup normalization statistics from dataset."""
+        stats = dataset.get_statistics()
         if 'action' in stats and 'state' in stats:
             model_for_stats = self.model.module if isinstance(self.model, DDP) else self.model
             model_for_stats.set_normalization_statistics(
@@ -237,200 +162,133 @@ class Pi0Workspace:
                 state_q99=stats['state']['q99'],
             )
             
-            if self.is_main_process:
+            if self._is_main_process:
                 print(f"Set normalization statistics:")
                 print(f"  Action q01: {stats['action']['q01']}")
                 print(f"  Action q99: {stats['action']['q99']}")
-        
-        # Create samplers for distributed training
-        train_sampler = None
-        val_sampler = None
-        if self.use_ddp:
-            train_sampler = DistributedSampler(
-                train_dataset,
-                num_replicas=self.world_size,
-                rank=self.rank,
-                shuffle=True,
-                seed=cfg.training.seed,
-            )
-            val_sampler = DistributedSampler(
-                val_dataset,
-                num_replicas=self.world_size,
-                rank=self.rank,
-                shuffle=False,
-            )
-        
-        # Create dataloaders
-        self.train_dataloader = DataLoader(
-            train_dataset,
-            batch_size=cfg.dataloader.batch_size,
-            sampler=train_sampler,
-            shuffle=(train_sampler is None),
-            num_workers=cfg.dataloader.num_workers,
-            pin_memory=cfg.dataloader.pin_memory,
-            collate_fn=collate_fn,
-        )
-        
-        self.val_dataloader = DataLoader(
-            val_dataset,
-            batch_size=cfg.val_dataloader.batch_size,
-            sampler=val_sampler,
-            shuffle=False,
-            num_workers=cfg.val_dataloader.num_workers,
-            pin_memory=cfg.val_dataloader.pin_memory,
-            collate_fn=collate_fn,
-        )
-        
-        if self.is_main_process:
-            print(f"Created dataloaders:")
-            print(f"  Train: {len(train_dataset)} samples, {len(self.train_dataloader)} batches")
-            print(f"  Val: {len(val_dataset)} samples, {len(self.val_dataloader)} batches")
     
-    def _init_wandb(self, resuming: bool = False):
-        """Initialize wandb logging (following openpi's init_wandb pattern)."""
-        if not self.is_main_process:
-            return
-        
-        cfg = self.cfg
-        
-        if not cfg.logging.wandb_enabled or cfg.logging.mode == "disabled":
-            wandb.init(mode="disabled")
-            self.wandb_run_id = None
-            return
-        
-        # Use checkpoint_dir for wandb_id file
-        wandb_id_file = self.checkpoint_dir / "wandb_id.txt"
-        
-        if resuming and wandb_id_file.exists():
-            run_id = wandb_id_file.read_text().strip()
-            wandb.init(
-                id=run_id,
-                resume="must",
-                project=cfg.logging.project,
-            )
-            self.wandb_run_id = run_id
-            print(f"Resumed wandb run: {run_id}")
-        else:
-            wandb.init(
-                name=cfg.logging.name,
-                config=OmegaConf.to_container(cfg, resolve=True),
-                project=cfg.logging.project,
-                tags=cfg.logging.tags,
-                mode=cfg.logging.mode,
-            )
-            # Save wandb ID for resuming
-            self.wandb_run_id = wandb.run.id
-            wandb_id_file.write_text(wandb.run.id)
-            print(f"Started new wandb run: {wandb.run.id}")
+    def _compute_loss(self, batch: Dict[str, Any]) -> torch.Tensor:
+        """Compute training loss using Pi0 model."""
+        model_to_use = self.model.module if isinstance(self.model, DDP) else self.model
+        loss = model_to_use.compute_loss(batch)
+        return loss
     
-    def _log_sample_observations(self):
-        """Log sample observations to wandb (following openpi's pattern)."""
-        if not self.is_main_process:
-            return
-        
-        if not self.cfg.logging.wandb_enabled or self.cfg.logging.mode == "disabled":
-            return
-        
-        try:
-            # Get a sample batch from the dataloader
-            sample_batch = next(iter(self.train_dataloader))
-            sample_batch = self._move_batch_to_device(sample_batch)
-            
-            # Create sample images for wandb - concatenate all camera views
-            images_to_log = []
-            image_dict = sample_batch["image"]
-            batch_size = next(iter(image_dict.values())).shape[0]
-            
-            for i in range(min(5, batch_size)):
-                # Concatenate all camera views horizontally for this batch item
-                # Images are in NCHW format, convert to NHWC for wandb
-                img_list = []
-                for cam_name in sorted(image_dict.keys()):
-                    img = image_dict[cam_name][i]  # CHW
-                    img = img.permute(1, 2, 0)  # HWC
-                    img = img.cpu().numpy()
-                    # Normalize to [0, 255] if needed
-                    if img.max() <= 1.0:
-                        img = (img * 255).astype(np.uint8)
-                    img_list.append(img)
-                
-                # Concatenate horizontally
-                img_concatenated = np.concatenate(img_list, axis=1)
-                images_to_log.append(wandb.Image(img_concatenated, caption=f"Sample {i}"))
-            
-            wandb.log({"sample_observations": images_to_log}, step=0)
-            print(f"Logged {len(images_to_log)} sample observations to wandb")
-            
-        except Exception as e:
-            print(f"Warning: Could not log sample observations to wandb: {e}")
+    def _get_collate_fn(self):
+        """Return Pi0's custom collate function for LeRobot format."""
+        return collate_fn
     
     def run(self):
-        """Main training loop."""
-        # Initialize components
-        if self.is_main_process:
-            print("="*80)
+        """
+        Main training loop.
+        
+        Overrides parent to add Pi0-specific features:
+        - Sample observation logging
+        - Safetensors checkpoint format
+        """
+        cfg = self.cfg
+        
+        # Print config at start
+        if self._is_main_process:
+            print("=" * 80)
             print("Initializing Pi0 Training")
-            print("="*80)
+            print("=" * 80)
+            print(OmegaConf.to_yaml(cfg))
+            print("=" * 80)
         
-        self._init_model()
+        # Initialize model
+        self.model = self._init_model()
+        if self._is_main_process:
+            total_params = sum(p.numel() for p in self.model.parameters())
+            trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+            print(f"Model parameters: {total_params:,} total, {trainable_params:,} trainable")
+        
+        # Initialize optimizer (from base class)
         self._init_optimizer()
-        self._init_dataloaders()
         
-        # Check for existing checkpoints to resume
+        # Initialize datasets and dataloaders
+        train_dataset, val_dataset = self._init_dataset()
+        self._init_dataloaders(train_dataset, val_dataset)
+        
+        # Wrap with DDP if distributed
+        if self.distributed:
+            self.model = DDP(
+                self.model,
+                device_ids=[self.local_rank],
+                output_device=self.local_rank,
+                find_unused_parameters=False,
+            )
+            if self._is_main_process:
+                print(f"Using DistributedDataParallel with {self.world_size} GPUs")
+        
+        # Resume from checkpoint
         resuming = self._load_checkpoint_if_exists()
         
         # Initialize wandb
-        self._init_wandb(resuming=resuming)
+        self._init_wandb(resuming)
         
-        # Log sample observations to wandb (only on new runs, not resume)
+        # Log sample observations (only on new runs)
         if not resuming:
             self._log_sample_observations()
         
         # Training loop
-        for epoch in range(self.epoch, self.cfg.training.num_epochs):
+        num_epochs = cfg.training.num_epochs
+        train_loss = 0.0
+        
+        for epoch in range(self.epoch, num_epochs):
             self.epoch = epoch
             
             # Set epoch for distributed sampler
-            if self.use_ddp and hasattr(self.train_dataloader.sampler, 'set_epoch'):
+            if self.distributed and hasattr(self.train_dataloader.sampler, 'set_epoch'):
                 self.train_dataloader.sampler.set_epoch(epoch)
             
             # Train epoch
             train_loss = self._train_epoch()
             
             # Validation
-            if (epoch + 1) % self.cfg.training.val_every == 0:
+            val_loss = None
+            if (epoch + 1) % cfg.training.val_every == 0:
                 val_loss = self._validate()
                 
-                if self.is_main_process:
-                    print(f"Epoch {epoch+1}: train_loss={train_loss:.6f}, val_loss={val_loss:.6f}")
+                if self._is_main_process:
+                    print(f"Epoch {epoch + 1}: train_loss={train_loss:.6f}, val_loss={val_loss:.6f}")
                     
-                    if self.cfg.logging.wandb_enabled:
+                    if cfg.logging.wandb_enabled:
                         wandb.log({
-                            "val_loss": val_loss,
-                            "epoch": epoch + 1,
+                            'val_loss': val_loss,
+                            'epoch': epoch + 1,
                         }, step=self.global_step)
             
-            # Save checkpoint (using epoch number like OpenVLA)
-            if (epoch + 1) % self.cfg.training.checkpoint_every == 0:
-                self._save_checkpoint(epoch=epoch + 1)
+            # Track best loss
+            current_loss = val_loss if val_loss is not None else train_loss
+            if current_loss < self.best_loss:
+                self.best_loss = current_loss
+                self._save_checkpoint(name="best")
+            
+            # Periodic checkpoint
+            if (epoch + 1) % cfg.training.checkpoint_every == 0:
+                self._save_checkpoint(name=f"epoch_{epoch + 1}")
             
             # Step scheduler
             if self.scheduler is not None:
                 self.scheduler.step()
         
         # Final checkpoint
-        self._save_checkpoint(epoch=num_epochs)
+        self._save_checkpoint(name=f"epoch_{num_epochs}")
         
         # Cleanup
-        if self.use_ddp:
-            dist.barrier()
-            dist.destroy_process_group()
+        from robofactory.policy.core import cleanup_distributed
+        cleanup_distributed()
         
-        if self.is_main_process and self.cfg.logging.wandb_enabled:
+        # Finish wandb
+        if self._is_main_process and cfg.logging.wandb_enabled:
+            wandb.run.summary["final_train_loss"] = train_loss
+            wandb.run.summary["best_loss"] = self.best_loss
+            wandb.run.summary["total_epochs"] = num_epochs
             wandb.finish()
-            print("\n" + "="*80)
+            
+            print("\n" + "=" * 80)
             print("Training completed!")
-            print("="*80)
+            print("=" * 80)
     
     def _train_epoch(self) -> float:
         """
@@ -438,60 +296,66 @@ class Pi0Workspace:
         
         Follows openpi's training pattern with periodic logging.
         """
+        cfg = self.cfg
         model_to_train = self.model.module if isinstance(self.model, DDP) else self.model
         model_to_train.model.train()
         
         # Reset periodic logging
         self.step_infos = []
         self.start_time = time.time()
+        total_loss = 0.0
+        num_batches = 0
+        
+        # Get logging frequency
+        log_every = cfg.logging.get('log_every_n_steps', 20)
         
         pbar = tqdm(
             self.train_dataloader,
-            desc=f"Train Epoch {self.epoch+1}",
-            disable=not self.is_main_process
+            desc=f"Train Epoch {self.epoch + 1}",
+            disable=not self._is_main_process,
         )
         
         for batch_idx, batch in enumerate(pbar):
             # Move batch to device
-            batch = self._move_batch_to_device(batch)
+            batch = self._move_to_device(batch)
             
-            # Forward pass (compute loss)
-            loss = model_to_train.compute_loss(batch)
-            
-            # Backward pass
-            loss = loss / self.cfg.training.gradient_accumulate_every
+            # Compute loss
+            loss = self._compute_loss(batch)
+            loss = loss / cfg.training.gradient_accumulate_every
             loss.backward()
             
-            # Store for periodic logging
+            # Track step loss
+            step_loss = loss.item() * cfg.training.gradient_accumulate_every
             self.step_infos.append({
-                "loss": loss.item() * self.cfg.training.gradient_accumulate_every,
+                "loss": step_loss,
                 "lr": self.optimizer.param_groups[0]['lr'],
             })
+            total_loss += step_loss
+            num_batches += 1
             
             # Gradient accumulation
-            if (batch_idx + 1) % self.cfg.training.gradient_accumulate_every == 0:
+            if (batch_idx + 1) % cfg.training.gradient_accumulate_every == 0:
                 # Clip gradients
                 grad_norm = torch.nn.utils.clip_grad_norm_(
                     model_to_train.parameters(),
-                    self.cfg.training.max_grad_norm
+                    cfg.training.max_grad_norm
                 )
                 
                 # Update parameters
                 self.optimizer.step()
                 self.optimizer.zero_grad()
-                
                 self.global_step += 1
                 
-                # Periodic logging (following openpi: every N steps, not every batch)
-                if self.global_step % self.cfg.logging.log_every_n_steps == 0 and len(self.step_infos) > 0:
+                # Periodic logging (following openpi: every N steps)
+                if self.global_step % log_every == 0 and len(self.step_infos) > 0:
                     elapsed = time.time() - self.start_time
                     
                     # Aggregate stats
                     avg_loss = np.mean([info["loss"] for info in self.step_infos])
                     avg_lr = np.mean([info["lr"] for info in self.step_infos])
                     
-                    # Log to wandb (openpi pattern)
-                    if self.is_main_process and self.cfg.logging.wandb_enabled:
+                    # Log to wandb
+                    if self._is_main_process and cfg.logging.wandb_enabled:
                         log_payload = {
                             "loss": avg_loss,
                             "learning_rate": avg_lr,
@@ -508,13 +372,12 @@ class Pi0Workspace:
                 
                 # Update progress bar
                 pbar.set_postfix({
-                    "loss": f"{loss.item():.4e}",
+                    "loss": f"{step_loss:.4e}",
                     "lr": f"{self.optimizer.param_groups[0]['lr']:.2e}",
                     "step": self.global_step
                 })
         
-        # Return average loss for epoch
-        return np.mean([info["loss"] for info in self.step_infos]) if self.step_infos else 0.0
+        return total_loss / num_batches if num_batches > 0 else 0.0
     
     def _validate(self) -> float:
         """Validate the model."""
@@ -524,47 +387,92 @@ class Pi0Workspace:
         total_loss = 0.0
         num_batches = 0
         
+        pbar = tqdm(
+            self.val_dataloader,
+            desc="Validation",
+            disable=not self._is_main_process,
+        )
+        
         with torch.no_grad():
-            for batch in tqdm(self.val_dataloader, desc="Validation", disable=not self.is_main_process):
-                batch = self._move_batch_to_device(batch)
-                loss = model_to_eval.compute_loss(batch)
+            for batch in pbar:
+                batch = self._move_to_device(batch)
+                loss = self._compute_loss(batch)
                 total_loss += loss.item()
                 num_batches += 1
         
-        avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
-        return avg_loss
+        return total_loss / num_batches if num_batches > 0 else 0.0
     
-    def _move_batch_to_device(self, batch: Dict) -> Dict:
-        """Move batch to device."""
-        result = {}
-        for key, value in batch.items():
-            if isinstance(value, torch.Tensor):
-                result[key] = value.to(self.device)
-            elif isinstance(value, dict):
-                # Handle nested dicts (like image dict)
-                result[key] = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v 
-                              for k, v in value.items()}
-            else:
-                result[key] = value
-        return result
-    
-    def _save_checkpoint(self, name: Optional[str] = None, epoch: Optional[int] = None):
-        """Save model checkpoint (following OpenVLA's epoch-based naming pattern)."""
-        if not self.is_main_process:
+    def _init_wandb(self, resuming: bool = False):
+        """Initialize wandb logging."""
+        if not self._is_main_process:
             return
         
-        # Use checkpoint_dir following OpenVLA pattern with epoch naming
-        if name is None:
-            if epoch is not None:
-                name = f"epoch_{epoch}"
-            else:
-                name = str(self.global_step)
-        checkpoint_path = self.checkpoint_dir / name
-        tmp_checkpoint_path = self.checkpoint_dir / f"tmp_{name}"
+        cfg = self.cfg
+        if not cfg.logging.wandb_enabled:
+            return
+        
+        # Use core init_wandb for consistent behavior
+        from robofactory.policy.core import init_wandb
+        self.wandb_run_id = init_wandb(
+            cfg=cfg,
+            resuming=resuming,
+            is_main_process=self._is_main_process,
+            checkpoint_dir=self._get_checkpoint_dir(),
+            run_id=self.wandb_run_id,
+        )
+    
+    def _log_sample_observations(self):
+        """Log sample observations to wandb (following openpi's pattern)."""
+        if not self._is_main_process:
+            return
+        
+        cfg = self.cfg
+        if not cfg.logging.wandb_enabled or cfg.logging.mode == "disabled":
+            return
+        
+        try:
+            # Get a sample batch
+            sample_batch = next(iter(self.train_dataloader))
+            sample_batch = self._move_to_device(sample_batch)
+            
+            # Create sample images for wandb
+            images_to_log = []
+            image_dict = sample_batch["image"]
+            batch_size = next(iter(image_dict.values())).shape[0]
+            
+            for i in range(min(5, batch_size)):
+                img_list = []
+                for cam_name in sorted(image_dict.keys()):
+                    img = image_dict[cam_name][i].cpu().numpy()
+                    if img.max() <= 1.0:
+                        img = (img * 255).astype(np.uint8)
+                    img_list.append(img)
+                
+                img_concatenated = np.concatenate(img_list, axis=1)
+                images_to_log.append(wandb.Image(img_concatenated, caption=f"Sample {i}"))
+            
+            wandb.log({"sample_observations": images_to_log}, step=0)
+            
+        except Exception as e:
+            print(f"Warning: Could not log sample observations to wandb: {e}")
+    
+    def _save_checkpoint(self, name: str):
+        """
+        Save model checkpoint using safetensors (following openpi convention).
+        
+        Args:
+            name: Checkpoint name (e.g., "epoch_1", "best", "final")
+        """
+        if not self._is_main_process:
+            return
+        
+        checkpoint_dir = self._get_checkpoint_dir()
+        checkpoint_path = checkpoint_dir / name
+        tmp_checkpoint_path = checkpoint_dir / f"tmp_{name}"
         
         # Create temp directory
+        import shutil
         if tmp_checkpoint_path.exists():
-            import shutil
             shutil.rmtree(tmp_checkpoint_path)
         tmp_checkpoint_path.mkdir(parents=True, exist_ok=True)
         
@@ -578,10 +486,14 @@ class Pi0Workspace:
         # Save optimizer
         torch.save(self.optimizer.state_dict(), tmp_checkpoint_path / "optimizer.pt")
         
+        # Save scheduler if exists
+        if self.scheduler is not None:
+            torch.save(self.scheduler.state_dict(), tmp_checkpoint_path / "scheduler.pt")
+        
         # Save training metadata
         metadata = {
             "global_step": self.global_step,
-            "epoch": self.epoch,
+            "epoch": self.epoch + 1,  # Save completed epoch number
             "best_loss": self.best_loss,
             "wandb_run_id": getattr(self, 'wandb_run_id', None),
         }
@@ -589,70 +501,75 @@ class Pi0Workspace:
         
         # Atomically move temp to final location
         if checkpoint_path.exists():
-            import shutil
             shutil.rmtree(checkpoint_path)
         tmp_checkpoint_path.rename(checkpoint_path)
         
         # Also save as latest for easy resuming
-        latest_path = self.checkpoint_dir / "latest"
+        latest_path = checkpoint_dir / "latest"
         if latest_path.exists():
-            import shutil
             shutil.rmtree(latest_path)
-        import shutil
         shutil.copytree(checkpoint_path, latest_path)
         
-        print(f"Saved checkpoint at {name} (step {self.global_step}) -> {checkpoint_path}")
-        
-        # Log to wandb
-        if self.cfg.logging.wandb_enabled:
-            wandb.log({"checkpoint_step": self.global_step}, step=self.global_step)
     
     def _load_checkpoint_if_exists(self) -> bool:
         """
         Load the latest checkpoint if it exists.
         
+        Prioritizes epoch_{number} checkpoints over 'latest'.
+        
         Returns:
             True if checkpoint was loaded, False otherwise
         """
-        if not self.cfg.training.resume:
+        cfg = self.cfg
+        if not cfg.training.get('resume', True):
             return False
         
-        # Use checkpoint_dir following OpenVLA pattern
-        if not self.checkpoint_dir.exists():
+        checkpoint_dir = self._get_checkpoint_dir()
+        if not checkpoint_dir.exists():
             return False
         
-        # First try "latest" checkpoint
-        latest_checkpoint = self.checkpoint_dir / "latest"
-        if not latest_checkpoint.exists():
-            # Fall back to finding highest numbered/epoch checkpoint
-            checkpoints = []
-            for d in self.checkpoint_dir.iterdir():
-                if d.is_dir():
-                    if d.name.isdigit():
-                        checkpoints.append((int(d.name), d))
-                    elif d.name.startswith("epoch_"):
-                        try:
-                            epoch_num = int(d.name.split("_")[1])
-                            checkpoints.append((epoch_num * 10000, d))  # Prioritize epoch checkpoints
-                        except:
-                            pass
-            if not checkpoints:
-                return False
-            latest_checkpoint = max(checkpoints, key=lambda x: x[0])[1]
+        # Find the highest numbered checkpoint
+        checkpoints = []
+        for d in checkpoint_dir.iterdir():
+            if d.is_dir():
+                if d.name.isdigit():
+                    checkpoints.append((int(d.name), d))
+                elif d.name.startswith("epoch_"):
+                    try:
+                        epoch_num = int(d.name.split("_")[1])
+                        checkpoints.append((epoch_num * 10000, d))  # Higher priority
+                    except:
+                        pass
+                elif d.name == "latest":
+                    checkpoints.append((-1, d))  # Lower priority fallback
         
-        if self.is_main_process:
+        if not checkpoints:
+            if self._is_main_process:
+                print(f"No checkpoint found in {checkpoint_dir}, starting fresh")
+            return False
+        
+        # Sort by priority and pick the best
+        latest_checkpoint = max(checkpoints, key=lambda x: x[0])[1]
+        
+        if self._is_main_process:
             print(f"Loading checkpoint from {latest_checkpoint}")
         
-        # Load model
+        # Load model using safetensors
         import safetensors.torch
         model_to_load = self.model.module if isinstance(self.model, DDP) else self.model
         state_dict = safetensors.torch.load_file(latest_checkpoint / "model.safetensors", device='cpu')
-        model_to_load.model.load_state_dict(state_dict)
+        # Use strict=False for tied weights (PaLI-Gemma)
+        model_to_load.model.load_state_dict(state_dict, strict=False)
         
         # Load optimizer
         if (latest_checkpoint / "optimizer.pt").exists():
             optimizer_state = torch.load(latest_checkpoint / "optimizer.pt", map_location='cpu')
             self.optimizer.load_state_dict(optimizer_state)
+        
+        # Load scheduler
+        if self.scheduler is not None and (latest_checkpoint / "scheduler.pt").exists():
+            scheduler_state = torch.load(latest_checkpoint / "scheduler.pt", map_location='cpu')
+            self.scheduler.load_state_dict(scheduler_state)
         
         # Load metadata
         if (latest_checkpoint / "metadata.pt").exists():
@@ -660,9 +577,9 @@ class Pi0Workspace:
             self.global_step = metadata.get("global_step", 0)
             self.epoch = metadata.get("epoch", 0)
             self.best_loss = metadata.get("best_loss", float('inf'))
+            self.wandb_run_id = metadata.get("wandb_run_id", None)
         
-        if self.is_main_process:
+        if self._is_main_process:
             print(f"Resumed from: epoch={self.epoch}, step={self.global_step}")
         
         return True
-

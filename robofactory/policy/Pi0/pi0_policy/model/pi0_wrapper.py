@@ -12,7 +12,7 @@ import torch
 import torch.nn as nn
 from pathlib import Path
 import logging
-from typing import Optional, Dict, Any, Tuple, List
+from typing import Optional, Dict, Tuple, List
 
 try:
     # Import from openpi (treated as external dependency)
@@ -84,6 +84,10 @@ class Pi0Model(nn.Module):
         
         self.model = PI0Pytorch(config)
         
+        # Monkey-patch to fix NHWC -> NCHW conversion issue
+        # openpi's preprocessing outputs NHWC but vision model expects NCHW
+        self._patch_image_format_conversion()
+        
         # Load pretrained weights if provided
         if pretrained_checkpoint:
             self.load_pretrained(pretrained_checkpoint)
@@ -112,6 +116,29 @@ class Pi0Model(nn.Module):
         trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
         print(f"Total parameters: {total_params:,}")
         print(f"Trainable parameters: {trainable_params:,} ({100*trainable_params/total_params:.2f}%)")
+    
+    def _patch_image_format_conversion(self):
+        """
+        Monkey-patch the model to convert images from NHWC to NCHW.
+        
+        openpi's preprocessing outputs NHWC format (batch, height, width, channels),
+        but the SigLIP vision model expects NCHW format (batch, channels, height, width).
+        This patch intercepts the PaliGemma forward call to convert format.
+        """
+        # Patch at the paligemma.model.get_image_features level
+        # This is the actual transformers PaliGemma model that expects NCHW
+        paligemma = self.model.paligemma_with_expert.paligemma
+        original_get_image_features = paligemma.model.get_image_features
+        
+        def patched_get_image_features(pixel_values, **kwargs):
+            # Convert from NHWC to NCHW if needed
+            # Check if last dim is small (channels) indicating NHWC format
+            if pixel_values.ndim == 4 and pixel_values.shape[-1] in [1, 3, 4]:  # [B, H, W, C]
+                pixel_values = pixel_values.permute(0, 3, 1, 2)  # -> [B, C, H, W]
+            return original_get_image_features(pixel_values, **kwargs)
+        
+        paligemma.model.get_image_features = patched_get_image_features
+        print("✓ Patched get_image_features for NHWC -> NCHW conversion")
     
     def load_pretrained(self, checkpoint_path: str):
         """

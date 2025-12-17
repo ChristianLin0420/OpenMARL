@@ -9,11 +9,12 @@ This module follows openpi's data format and conventions:
 """
 
 import torch
-from torch.utils.data import Dataset
 import numpy as np
-from typing import Dict, Optional, Tuple, List
+from typing import Dict, List
 from pathlib import Path
-import json
+
+# Import base class from core
+from robofactory.policy.core import BaseVLADataset
 
 try:
     # Try new lerobot structure (v0.4+)
@@ -27,7 +28,7 @@ except ImportError:
         LeRobotDataset = None
 
 
-class RobotLeRobotDataset(Dataset):
+class RobotLeRobotDataset(BaseVLADataset):
     """
     PyTorch Dataset for loading LeRobot format data for Pi0/Pi0.5 training.
     
@@ -145,15 +146,17 @@ class RobotLeRobotDataset(Dataset):
         image_masks = {}
         
         # Pi0 requires EXACTLY these 3 keys (in order)
+        # IMPORTANT: openpi expects images in HWC format (height, width, channels), NOT CHW!
+        
         # base_0_rgb: Base/exterior camera (third-person view)
         if "base_0_rgb" in sample:
             images["base_0_rgb"] = torch.from_numpy(
                 np.array(sample["base_0_rgb"])
             ).float()
-            # Check if already in CHW format
-            if images["base_0_rgb"].ndim == 3 and images["base_0_rgb"].shape[-1] == 3:
-                # Convert HWC -> CHW
-                images["base_0_rgb"] = images["base_0_rgb"].permute(2, 0, 1)
+            # openpi expects HWC format - convert CHW to HWC if needed
+            if images["base_0_rgb"].ndim == 3 and images["base_0_rgb"].shape[0] == 3:
+                # CHW -> HWC
+                images["base_0_rgb"] = images["base_0_rgb"].permute(1, 2, 0)
             # Normalize to [0, 1]
             if images["base_0_rgb"].max() > 1.0:
                 images["base_0_rgb"] = images["base_0_rgb"] / 255.0
@@ -166,8 +169,9 @@ class RobotLeRobotDataset(Dataset):
             images["left_wrist_0_rgb"] = torch.from_numpy(
                 np.array(sample["left_wrist_0_rgb"])
             ).float()
-            if images["left_wrist_0_rgb"].ndim == 3 and images["left_wrist_0_rgb"].shape[-1] == 3:
-                images["left_wrist_0_rgb"] = images["left_wrist_0_rgb"].permute(2, 0, 1)
+            # openpi expects HWC format
+            if images["left_wrist_0_rgb"].ndim == 3 and images["left_wrist_0_rgb"].shape[0] == 3:
+                images["left_wrist_0_rgb"] = images["left_wrist_0_rgb"].permute(1, 2, 0)
             if images["left_wrist_0_rgb"].max() > 1.0:
                 images["left_wrist_0_rgb"] = images["left_wrist_0_rgb"] / 255.0
             image_masks["left_wrist_0_rgb"] = torch.tensor(True)
@@ -181,8 +185,9 @@ class RobotLeRobotDataset(Dataset):
             images["right_wrist_0_rgb"] = torch.from_numpy(
                 np.array(sample["right_wrist_0_rgb"])
             ).float()
-            if images["right_wrist_0_rgb"].ndim == 3 and images["right_wrist_0_rgb"].shape[-1] == 3:
-                images["right_wrist_0_rgb"] = images["right_wrist_0_rgb"].permute(2, 0, 1)
+            # openpi expects HWC format
+            if images["right_wrist_0_rgb"].ndim == 3 and images["right_wrist_0_rgb"].shape[0] == 3:
+                images["right_wrist_0_rgb"] = images["right_wrist_0_rgb"].permute(1, 2, 0)
             if images["right_wrist_0_rgb"].max() > 1.0:
                 images["right_wrist_0_rgb"] = images["right_wrist_0_rgb"] / 255.0
             image_masks["right_wrist_0_rgb"] = torch.tensor(True)

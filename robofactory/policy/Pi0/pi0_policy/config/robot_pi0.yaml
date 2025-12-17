@@ -1,3 +1,7 @@
+# Pi0 policy configuration
+# Inherits from: robofactory/policy/core/config/base_training.yaml
+# Inherits from: robofactory/policy/core/config/base_logging.yaml
+
 defaults:
   - _self_
   - task: default_task

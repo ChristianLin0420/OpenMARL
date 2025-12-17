@@ -1,3 +1,7 @@
+# Diffusion Policy configuration
+# Inherits from: robofactory/policy/core/config/base_training.yaml
+# Inherits from: robofactory/policy/core/config/base_logging.yaml
+
 defaults:
   - _self_
   - task: default_task
@@ -74,18 +78,18 @@ ema:
   max_value: 0.9999
 
 dataloader:
-  batch_size: 64
-  num_workers: 8
+  batch_size: 8
+  num_workers: 0
   shuffle: True
   pin_memory: True
   persistent_workers: True
 
 val_dataloader:
-  batch_size: 64
-  num_workers: 4
+  batch_size: 8
+  num_workers: 0
   shuffle: False
   pin_memory: True
-  persistent_workers: True
+  persistent_workers: False
 
 optimizer:
   _target_: torch.optim.AdamW
@@ -102,7 +106,7 @@ training:
   # optimization
   lr_scheduler: cosine
   lr_warmup_steps: 500
-  num_epochs: 500
+  num_epochs: 2
   gradient_accumulate_every: 1
   max_grad_norm: 1.0
   # EMA destroys performance when used with BatchNorm
@@ -112,7 +116,7 @@ training:
   # training loop control
   # in epochs
   rollout_every: 50
-  checkpoint_every: 100
+  checkpoint_every: 1
   val_every: 1
   sample_every: 5
   # steps per epoch
@@ -129,7 +133,7 @@ training:
   eval_sim_max_steps: 200         # Max steps per episode
 
 logging:
-  project: "openmarl"
+  project: "test"
   resume: True
   mode: online
   name: "${task_name}_${exp_name}_Agent${agent_id}"
