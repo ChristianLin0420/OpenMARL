@@ -41,7 +41,7 @@ model:
 training:
   device: "cuda:0"
   seed: 42
-  num_epochs: 3
+  num_epochs: 30
   
   # Optimizer (openpi defaults)
   learning_rate: 5.0e-4
@@ -59,26 +59,26 @@ training:
   val_every: 10
   
   # Checkpointing (following openpi pattern)
-  checkpoint_every: 1
+  checkpoint_every: 10
   save_interval: 5000  # Save every N steps (openpi convention)
   resume: true
 
 # Dataloader configuration
 dataloader:
   batch_size: 8
-  num_workers: 4  # Set to 0 to avoid shared memory issues in Docker
+  num_workers: 0  # Set to 0 to avoid shared memory issues in Docker
   shuffle: true
   pin_memory: true
 
 val_dataloader:
   batch_size: 8
-  num_workers: 4  # Set to 0 to avoid shared memory issues in Docker
+  num_workers: 0  # Set to 0 to avoid shared memory issues in Docker
   shuffle: false
   pin_memory: true
 
 # Logging configuration (following openpi's train_pytorch.py)
 logging:
-  project: "openmarl"
+  project: "test"
   mode: "online"  # "online", "offline", or "disabled"
   name: "${task_name}_${exp_name}_Agent${agent_id}"
   tags: ["pi0", "${task_name}", "Agent${agent_id}"]

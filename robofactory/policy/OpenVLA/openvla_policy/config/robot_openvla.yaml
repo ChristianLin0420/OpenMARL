@@ -53,7 +53,7 @@ training:
   val_every: 5                        # Validate every 5 epochs
   
   # Checkpointing
-  checkpoint_every: 10                # Checkpoint every 10 epochs
+  checkpoint_every: 5                # Checkpoint every 10 epochs
   resume: True
   
   # Early stopping
@@ -76,13 +76,13 @@ training:
 # Dataloader configuration
 dataloader:
   batch_size: 8
-  num_workers: 4  # Set to 0 to avoid Docker shared memory issues
+  num_workers: 0  # Set to 0 to avoid Docker shared memory issues
   shuffle: True
   pin_memory: True
 
 val_dataloader:
   batch_size: 8
-  num_workers: 4  # Set to 0 to avoid Docker shared memory issues
+  num_workers: 0  # Set to 0 to avoid Docker shared memory issues
   shuffle: False
   pin_memory: True
 
