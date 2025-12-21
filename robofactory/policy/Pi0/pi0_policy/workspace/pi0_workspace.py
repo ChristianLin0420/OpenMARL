@@ -76,18 +76,10 @@ class Pi0Workspace(BaseVLAWorkspace):
         task_name = cfg.task.name if hasattr(cfg.task, 'name') else cfg.get('task_name', 'unknown')
         agent_id = cfg.get('agent_id', 0)
         
-        # Extract data count from lerobot_path if available
-        data_count = "150"  # default
-        if hasattr(cfg.task, 'lerobot_path'):
-            lerobot_path = cfg.task.lerobot_path
-            match = re.search(r'_(\d+)$', lerobot_path)
-            if match:
-                data_count = match.group(1)
-        
         # Model type (pi0 or pi05)
         model_type = cfg.model.get('model_variant', 'pi0')
         
-        return Path('robofactory/checkpoints') / model_type / f"{task_name}_Agent{agent_id}_{data_count}"
+        return Path('robofactory/checkpoints') / model_type / f"{task_name}_Agent{agent_id}"
     
     def _init_model(self) -> nn.Module:
         """Initialize Pi0 model."""

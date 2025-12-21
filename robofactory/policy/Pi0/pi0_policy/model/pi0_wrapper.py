@@ -7,11 +7,12 @@ adapting them for RoboFactory's multi-agent manipulation tasks.
 The wrapper uses openpi as an external dependency and follows
 openpi's data format and training patterns.
 """
-
+import os
 import torch
 import torch.nn as nn
 from pathlib import Path
 import logging
+import torch.distributed as dist
 from typing import Optional, Dict, Tuple, List
 
 try:
@@ -147,10 +148,28 @@ class Pi0Model(nn.Module):
         Args:
             checkpoint_path: Path to checkpoint (can be GCS path or local path)
         """
-        print(f"Loading pretrained weights from {checkpoint_path}...")
+        
+        # Get distributed training info
+        rank = int(os.environ.get("RANK", 0))
+        world_size = int(os.environ.get("WORLD_SIZE", 1))
+        is_distributed = world_size > 1
+        
+        if rank == 0:
+            print(f"Loading pretrained weights from {checkpoint_path}...")
         
         # Download from GCS if needed (using openpi's download utility)
-        local_path = download.maybe_download(checkpoint_path)
+        # Only rank 0 downloads to avoid race condition on shared filesystem
+        if rank == 0:
+            local_path = download.maybe_download(checkpoint_path)
+            print(f"Downloaded checkpoint to: {local_path}")
+        
+        # Wait for rank 0 to finish downloading
+        if is_distributed and dist.is_initialized():
+            dist.barrier()
+        
+        # Other ranks now get the local path (should be cached)
+        if rank != 0:
+            local_path = download.maybe_download(checkpoint_path)
         
         # OpenPI checkpoints are in Orbax format (JAX), need to load and convert to PyTorch
         # The checkpoint structure is: checkpoint_dir/params/ (Orbax format)
