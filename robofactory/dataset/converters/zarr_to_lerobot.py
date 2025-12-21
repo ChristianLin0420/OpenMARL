@@ -483,61 +483,39 @@ def _verify_parquet_file(parquet_path: Path) -> bool:
 
 
 def _consolidate_parquet_files(output_path: Path):
-    """Consolidate parquet files and return actual frame count.
+    """Count total frames from all parquet files WITHOUT merging.
     
-    This function is optional - if parquet files can't be read, the dataset
-    may still be usable. We just skip consolidation in that case.
+    LeRobot v3.0+ natively supports reading multiple parquet files via
+    the data_path template in info.json. Merging is not only unnecessary
+    but causes memory issues for large datasets during training.
+    
+    The HuggingFace Datasets library underneath LeRobot automatically
+    discovers and reads all parquet files matching the data_path pattern.
     """
-    import pyarrow as pa
     import pyarrow.parquet as pq
     
     data_chunk_dir = output_path / "data" / "chunk-000"
-    actual_total_frames = None
+    actual_total_frames = 0
     
     if not data_chunk_dir.exists():
-        print(f"   Note: No data/chunk-000 directory found, skipping consolidation")
+        print(f"   Note: No data/chunk-000 directory found, skipping frame count")
         return None
     
     parquet_files = sorted(data_chunk_dir.glob("*.parquet"))
     if len(parquet_files) == 0:
-        print(f"   Note: No parquet files found in {data_chunk_dir}, skipping consolidation")
+        print(f"   Note: No parquet files found in {data_chunk_dir}, skipping frame count")
         return None
     
-    # Try to read the first parquet file
-    try:
-        main_table = pq.read_table(parquet_files[0])
-        actual_total_frames = len(main_table)
-    except Exception as e:
-        # If we can't read the parquet files, it might be a LeRobot version issue
-        # where data is stored differently. Just skip consolidation.
-        print(f"   Note: Could not read parquet file ({e}), skipping consolidation")
-        print(f"   The dataset may still be usable - LeRobot stores data in different ways")
-        return None
-    
-    # Consolidate multiple parquet files if needed
-    if len(parquet_files) > 1:
-        print(f"   Consolidating {len(parquet_files)} parquet files into one...")
-        tables = [main_table]
-        for pf in parquet_files[1:]:
-            try:
-                tables.append(pq.read_table(pf))
-            except Exception as e:
-                print(f"   Warning: Could not read {pf.name}: {e}, skipping")
-        
+    # Count frames from all parquet files WITHOUT merging
+    print(f"   Counting frames from {len(parquet_files)} parquet file(s)...")
+    for pf in parquet_files:
         try:
-            merged_table = pa.concat_tables(tables)
-            actual_total_frames = len(merged_table)
-            
-            for pf in parquet_files:
-                pf.unlink()
-            
-            merged_path = data_chunk_dir / "file-000.parquet"
-            pq.write_table(merged_table, merged_path)
-            print(f"   ✓ Consolidated into single file: {merged_path.name} ({actual_total_frames} rows)")
+            table = pq.read_table(pf)
+            actual_total_frames += len(table)
         except Exception as e:
-            print(f"   Warning: Could not consolidate parquet files: {e}")
-            # Keep original files, return count from first file
+            print(f"   Warning: Could not read {pf.name}: {e}, skipping")
     
+    print(f"   ✓ Total frames: {actual_total_frames} across {len(parquet_files)} file(s)")
     return actual_total_frames
 
 
