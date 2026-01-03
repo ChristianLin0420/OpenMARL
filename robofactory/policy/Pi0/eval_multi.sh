@@ -1,14 +1,18 @@
 #!/bin/bash
 
 # Parallel evaluation for Pi0/Pi0.5 using all available GPUs
-# Usage: ./eval_multi.sh <config_name> <policy_type> <data_num> <checkpoint_step> [debug_mode] [task_name]
+# Usage: ./eval_multi.sh <config_name> <policy_type> <data_num> <checkpoint_step> [debug_mode] [task_name] [max_steps] [num_eval]
 #
 # Examples:
 #   ./eval_multi.sh LiftBarrier pi0 150 5000
-#   ./eval_multi.sh TwoRobotsStackCube pi05 150 10000 0 TwoRobotsStackCube-rf
+#   ./eval_multi.sh TwoRobotsStackCube pi05 150 10000 0 TwoRobotsStackCube-rf 1000 50
+
+# Change to the script's directory so relative paths work correctly
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"
 
 if [ -z "$1" ] || [ -z "$2" ] || [ -z "$3" ] || [ -z "$4" ]; then
-    echo "Usage: $0 <config_name> <policy_type> <data_num> <checkpoint_step> [debug_mode] [task_name]"
+    echo "Usage: $0 <config_name> <policy_type> <data_num> <checkpoint_step> [debug_mode] [task_name] [max_steps] [num_eval]"
     echo ""
     echo "Arguments:"
     echo "  config_name      : Task config name (e.g., LiftBarrier)"
@@ -17,10 +21,12 @@ if [ -z "$1" ] || [ -z "$2" ] || [ -z "$3" ] || [ -z "$4" ]; then
     echo "  checkpoint_step  : Training step of checkpoint (e.g., 5000)"
     echo "  debug_mode       : Debug mode 0/1 (default: 0)"
     echo "  task_name        : Full task name with suffix (default: <config_name>-rf)"
+    echo "  max_steps        : Maximum steps per episode (default: 250)"
+    echo "  num_eval         : Number of evaluation episodes (default: 100)"
     echo ""
     echo "Examples:"
     echo "  $0 LiftBarrier pi0 150 5000"
-    echo "  $0 TwoRobotsStackCube pi05 150 10000 0 TwoRobotsStackCube-rf"
+    echo "  $0 TwoRobotsStackCube pi05 150 10000 0 TwoRobotsStackCube-rf 1000 50"
     exit 1
 fi
 
@@ -30,6 +36,8 @@ DATA_NUM="$3"
 CHECKPOINT_STEP="$4"
 DEBUG_MODE="${5:-0}"
 TASK_NAME="${6:-${CONFIG_NAME}-rf}"
+MAX_STEPS="${7:-250}"
+NUM_EVAL="${8:-100}"
 
 # Validate policy type
 if [ "$POLICY_TYPE" != "pi0" ] && [ "$POLICY_TYPE" != "pi05" ]; then
@@ -37,18 +45,36 @@ if [ "$POLICY_TYPE" != "pi0" ] && [ "$POLICY_TYPE" != "pi05" ]; then
     exit 1
 fi
 
-# Number of GPUs to use
-NUM_GPUS=1
+# Automatically detect number of available GPUs
+if command -v nvidia-smi &> /dev/null; then
+    NUM_GPUS=$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l)
+    GPU_NAMES=$(nvidia-smi --query-gpu=name --format=csv,noheader | head -1)
+else
+    NUM_GPUS=1
+    GPU_NAMES="Unknown"
+fi
+
+# Ensure at least 1 GPU
+if [ "$NUM_GPUS" -lt 1 ]; then
+    NUM_GPUS=1
+fi
+
 START_SEED=1000
-END_SEED=1099
-TOTAL_SEEDS=$((END_SEED - START_SEED + 1))
+END_SEED=$((START_SEED + NUM_EVAL - 1))
+TOTAL_SEEDS=$NUM_EVAL
+
+# Cap NUM_GPUS to TOTAL_SEEDS (no point using more GPUs than seeds)
+if [ "$NUM_GPUS" -gt "$TOTAL_SEEDS" ]; then
+    NUM_GPUS=$TOTAL_SEEDS
+fi
 
 LOG_FILE="eval_results_${POLICY_TYPE}_${TASK_NAME}_${DATA_NUM}_${CHECKPOINT_STEP}_$(date +"%Y%m%d_%H%M%S").log"
 TEMP_DIR=$(mktemp -d)
 
 echo "Evaluating Pi0/Pi0.5 task: $TASK_NAME"
 echo "Policy Type: $POLICY_TYPE"
-echo "Using $NUM_GPUS GPUs for parallel evaluation"
+echo "Detected $NUM_GPUS GPUs ($GPU_NAMES)"
+echo "Using $NUM_GPUS GPUs for parallel evaluation (~$((TOTAL_SEEDS / NUM_GPUS)) seeds/GPU)"
 echo "Seeds: $START_SEED to $END_SEED ($TOTAL_SEEDS total)"
 echo "Evaluating $POLICY_TYPE task: $TASK_NAME" >> "$LOG_FILE"
 echo "Parallel evaluation with $NUM_GPUS GPUs" >> "$LOG_FILE"
@@ -71,21 +97,21 @@ run_gpu_eval() {
         # Construct config path
         CONFIG_PATH="../../configs/table/${CONFIG_NAME}.yaml"
         
-        PYTHONPATH="$(pwd)/..:$(pwd)/../..:$PYTHONPATH" CUDA_VISIBLE_DEVICES=$gpu_id OUTPUT=$(python eval_multi_pi0.py \
+        PYTHONPATH="$(pwd)/../..:$(pwd)/../../..:$PYTHONPATH" CUDA_VISIBLE_DEVICES=$gpu_id OUTPUT=$(python eval_multi_pi0.py \
             --config="$CONFIG_PATH" \
             --policy_type="$POLICY_TYPE" \
             --data_num=$DATA_NUM \
             --checkpoint_step=$CHECKPOINT_STEP \
             --debug=0 \
             --seed=$seed \
-            --max_steps=250 \
+            --max_steps=$MAX_STEPS \
             --render_mode="rgb_array" \
             --obs_mode="rgb" \
             --num_eval_episodes=1 2>&1)
         
-        LAST_LINE=$(echo "$OUTPUT" | tail -n 1)
         fine=0
-        if [[ $LAST_LINE == *"SUCCESS"* ]] || [[ $OUTPUT == *"success': True"* ]]; then
+        # Check for "Success: True" in the output (matching Python's print format)
+        if [[ $OUTPUT == *"Success: True"* ]]; then
             fine=1
             ((success++))
         fi
@@ -94,6 +120,15 @@ run_gpu_eval() {
         
         if [ "$DEBUG_MODE" -eq 1 ]; then
             echo "Seed $seed: $([ $fine -eq 1 ] && echo 'SUCCESS' || echo 'FAIL')"
+            echo "Output: $OUTPUT"
+            echo "---"
+        fi
+        
+        # Show first failure's full output for debugging
+        if [ $fine -eq 0 ] && [ $total -eq 1 ]; then
+            echo "First episode failed. Output:"
+            echo "$OUTPUT" | tail -n 50
+            echo "---"
         fi
     done
     

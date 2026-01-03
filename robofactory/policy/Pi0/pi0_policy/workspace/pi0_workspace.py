@@ -482,12 +482,18 @@ class Pi0Workspace(BaseVLAWorkspace):
         if self.scheduler is not None:
             torch.save(self.scheduler.state_dict(), tmp_checkpoint_path / "scheduler.pt")
         
-        # Save training metadata
+        # Save training metadata (including normalization stats for evaluation)
         metadata = {
             "global_step": self.global_step,
             "epoch": self.epoch + 1,  # Save completed epoch number
             "best_loss": self.best_loss,
             "wandb_run_id": getattr(self, 'wandb_run_id', None),
+            "normalization_stats": {
+                "action_q01": model_to_save.action_q01.cpu(),
+                "action_q99": model_to_save.action_q99.cpu(),
+                "state_q01": model_to_save.state_q01.cpu(),
+                "state_q99": model_to_save.state_q99.cpu(),
+            },
         }
         torch.save(metadata, tmp_checkpoint_path / "metadata.pt")
         

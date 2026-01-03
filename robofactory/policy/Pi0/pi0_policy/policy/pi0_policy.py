@@ -12,7 +12,11 @@ from pathlib import Path
 from typing import Dict, Optional
 from omegaconf import OmegaConf
 
-from .model.pi0_wrapper import Pi0Model
+# Disable torch.compile/dynamo for evaluation to avoid caching issues with patched functions
+import torch._dynamo
+torch._dynamo.config.suppress_errors = True
+
+from ..model.pi0_wrapper import Pi0Model
 
 # Import core base class and shared utilities
 from robofactory.policy.core import BaseVLAPolicy
@@ -130,13 +134,18 @@ class Pi0Policy(BaseVLAPolicy):
                     state_q01=stats["state_q01"],
                     state_q99=stats["state_q99"],
                 )
+                print(f"Loaded normalization statistics from checkpoint")
+            else:
+                print("WARNING: No normalization_stats in checkpoint metadata!")
+                print("  This checkpoint was saved before the fix. Actions will be incorrectly scaled.")
+                print("  Please retrain or manually add statistics to the checkpoint.")
     
     def predict_action(
         self,
         observation: Dict[str, np.ndarray],
     ) -> np.ndarray:
         """
-        Predict action from observation.
+        Predict action sequence from observation.
         
         Args:
             observation: Dict with keys:
@@ -144,7 +153,8 @@ class Pi0Policy(BaseVLAPolicy):
                 - "state": Robot state [state_dim]
                 
         Returns:
-            Action array [action_dim] (first action from predicted sequence)
+            Action sequence array [action_horizon, action_dim] for action chunking.
+            The ActionChunkingWrapper will buffer these and return one at a time.
         """
         # Prepare images
         if isinstance(observation["images"], dict):
@@ -164,28 +174,35 @@ class Pi0Policy(BaseVLAPolicy):
                 raise ValueError("Unexpected image format")
         
         # Convert to tensors and add batch dimension
+        # OpenPI expects images in NHWC format [batch, height, width, channels]
+        # with masks as 1D boolean tensors of shape [batch]
         image_tensors = {}
         image_masks = {}
         
         for key in ["base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb"]:
             if key in images:
                 img = images[key]
-                # Convert to CHW format and normalize
                 if isinstance(img, np.ndarray):
                     img = torch.from_numpy(img).float()
-                if img.ndim == 3 and img.shape[-1] == 3:  # HWC -> CHW
-                    img = img.permute(2, 0, 1)
+                
+                # Ensure HWC format
+                if img.ndim == 3 and img.shape[0] == 3:  # CHW -> HWC
+                    img = img.permute(1, 2, 0)
+                
+                # Normalize to [0, 1] if needed
                 if img.max() > 1.0:
                     img = img / 255.0
                 
+                # Add batch dimension -> [1, H, W, C] (NHWC)
                 image_tensors[key] = img.unsqueeze(0).to(self.device)
-                image_masks[key] = torch.tensor([True]).to(self.device)
+                # Mask should be 1D tensor [batch] to match training collate format
+                image_masks[key] = torch.tensor([True], dtype=torch.bool).to(self.device)
             else:
-                # Create dummy if missing
-                image_tensors[key] = torch.zeros(1, 3, 224, 224).to(self.device)
-                image_masks[key] = torch.tensor([False]).to(self.device)
+                # Create dummy if missing [1, H, W, C]
+                image_tensors[key] = torch.zeros(1, 224, 224, 3).to(self.device)
+                image_masks[key] = torch.tensor([False], dtype=torch.bool).to(self.device)
         
-        # Prepare state
+        # Prepare state [1, state_dim]
         state = torch.from_numpy(observation["state"]).float().unsqueeze(0).to(self.device)
         
         # Predict actions
@@ -197,10 +214,10 @@ class Pi0Policy(BaseVLAPolicy):
                 prompt=self.language_instruction,
             )
         
-        # Return first action from sequence
-        action = action_sequence[0].cpu().numpy()
-        
-        return action
+        # Return FULL action sequence for action chunking
+        # model.predict() already removes batch dim, so action_sequence is [action_horizon, action_dim]
+        # The ActionChunkingWrapper will buffer all actions and return them one at a time
+        return action_sequence.cpu().numpy()
     
     def reset(self):
         """Reset policy state (if needed)."""

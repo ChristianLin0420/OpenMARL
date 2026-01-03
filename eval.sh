@@ -26,8 +26,8 @@ DATA_NUM=160
 CHECKPOINT_NUM=500
 DEBUG_MODE=0
 SEED_START=1000
-NUM_EVAL=100
-MAX_STEPS=250
+NUM_EVAL=20
+MAX_STEPS=1000
 ALL_TASKS=false
 RESULTS_DIR="evaluation_results"
 
@@ -40,6 +40,17 @@ get_policy_dir_name() {
         pi0)     echo "pi0" ;;
         pi05)    echo "pi05" ;;
         *)       echo "$policy" ;;
+    esac
+}
+
+# Get checkpoint directory suffix based on policy
+# diffusion_policy uses _DATA_NUM, openvla/pi0/pi05 do not
+get_checkpoint_suffix() {
+    local policy="$1"
+    case "$policy" in
+        dp)      echo "_${DATA_NUM}" ;;
+        openvla|pi0|pi05) echo "" ;;
+        *)       echo "_${DATA_NUM}" ;;
     esac
 }
 
@@ -190,7 +201,8 @@ get_config_file() {
 is_task_trained() {
     local task_name="$1"
     local policy_dir=$(get_policy_dir_name "$POLICY")
-    local checkpoint_dir="robofactory/checkpoints/${policy_dir}/${task_name}_Agent0_${DATA_NUM}"
+    local ckpt_suffix=$(get_checkpoint_suffix "$POLICY")
+    local checkpoint_dir="robofactory/checkpoints/${policy_dir}/${task_name}_Agent0${ckpt_suffix}"
     
     if [[ -d "$checkpoint_dir" ]]; then
         # Check if checkpoint file exists
@@ -206,9 +218,10 @@ get_trained_tasks() {
     local tasks=()
     local policy_dir=$(get_policy_dir_name "$POLICY")
     
-    for checkpoint_dir in robofactory/checkpoints/${policy_dir}/*_Agent0_${DATA_NUM}; do
+    local ckpt_suffix=$(get_checkpoint_suffix "$POLICY")
+    for checkpoint_dir in robofactory/checkpoints/${policy_dir}/*_Agent0${ckpt_suffix}; do
         if [[ -d "$checkpoint_dir" ]]; then
-            local task_name=$(basename "$checkpoint_dir" | sed "s/_Agent0_${DATA_NUM}$//")
+            local task_name=$(basename "$checkpoint_dir" | sed "s/_Agent0${ckpt_suffix}$//")
             if is_task_trained "$task_name"; then
                 tasks+=("$task_name")
             fi
@@ -223,8 +236,9 @@ get_agent_count() {
     local task_name="$1"
     local policy_dir=$(get_policy_dir_name "$POLICY")
     local count=0
+    local ckpt_suffix=$(get_checkpoint_suffix "$POLICY")
     
-    for agent_dir in robofactory/checkpoints/${policy_dir}/${task_name}_Agent*_${DATA_NUM}; do
+    for agent_dir in robofactory/checkpoints/${policy_dir}/${task_name}_Agent*${ckpt_suffix}; do
         if [[ -d "$agent_dir" ]]; then
             count=$((count + 1))
         fi
@@ -270,7 +284,6 @@ eval_diffusion_policy() {
         "$task"
     
     cd ..
-    return 0
 }
 
 eval_openvla() {
@@ -287,7 +300,7 @@ eval_openvla() {
     cd robofactory
     
     # Check if checkpoint exists
-    local checkpoint_dir="checkpoints/${policy_dir}/${task}_Agent0_${DATA_NUM}"
+    local checkpoint_dir="checkpoints/${policy_dir}/${task}_Agent0"
     if [[ ! -d "$checkpoint_dir" ]]; then
         log "${YELLOW}Warning: Checkpoint directory not found: ${checkpoint_dir}${NC}"
         log "${YELLOW}Make sure the policy is trained before evaluation${NC}"
@@ -324,7 +337,7 @@ eval_pi0() {
     cd robofactory
     
     # Check if checkpoint exists
-    local checkpoint_dir="checkpoints/${policy_dir}/${task}_Agent0_${DATA_NUM}"
+    local checkpoint_dir="checkpoints/${policy_dir}/${task}_Agent0"
     if [[ ! -d "$checkpoint_dir" ]]; then
         log "${YELLOW}Warning: Checkpoint directory not found: ${checkpoint_dir}${NC}"
         log "${YELLOW}Make sure the policy is trained before evaluation${NC}"
@@ -335,14 +348,21 @@ eval_pi0() {
     # Use config path relative to robofactory
     local relative_config="${config#robofactory/}"
     
-    # Call eval_multi_pi0.sh for parallel multi-GPU evaluation
+    # Extract config base name (e.g., "lift_barrier" from "configs/table/lift_barrier.yaml")
+    local config_name=$(basename "${relative_config}" .yaml)
+    
+    # Call eval_multi.sh for parallel multi-GPU evaluation
+    # Arguments: <config_name> <policy_type> <data_num> <checkpoint_step> [debug_mode] [task_name] [max_steps] [num_eval]
     bash policy/Pi0/eval_multi.sh \
-        "$relative_config" \
+        "$config_name" \
+        "$POLICY" \
         "$DATA_NUM" \
         "$CHECKPOINT_NUM" \
         "$DEBUG_MODE" \
         "$task" \
-        "$POLICY"
+        "$MAX_STEPS" \
+        "$NUM_EVAL"
+    
     
     cd ..
     return 0

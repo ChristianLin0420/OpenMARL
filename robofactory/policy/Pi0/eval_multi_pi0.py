@@ -80,7 +80,7 @@ def parse_args():
     parser.add_argument(
         '--record_dir',
         type=str,
-        default='./eval_video/{env_id}',
+        default='../../eval_video/{policy_type}/{env_id}',
         help='Directory to save evaluation videos'
     )
     parser.add_argument(
@@ -127,10 +127,10 @@ def get_model_input(observation, agent_pos, agent_id, num_cameras=3):
     """
     Extract model input from observation.
     
-    Pi0 requires 3 camera views:
-    - base_0_rgb: head_camera (side view)
-    - left_wrist_0_rgb: global_camera (overhead view)
-    - right_wrist_0_rgb: wrist_camera (gripper view)
+    Pi0 requires 3 camera views (matching training data):
+    - base_0_rgb: head_camera_agent{id} (side view)
+    - left_wrist_0_rgb: head_camera_global (overhead view)
+    - right_wrist_0_rgb: wrist_camera_agent{id} (gripper view, if available)
     
     Args:
         observation: Environment observation
@@ -142,23 +142,40 @@ def get_model_input(observation, agent_pos, agent_id, num_cameras=3):
         Dictionary with 'images' and 'state'
     """
     images = []
+    sensor_data = observation['sensor_data']
     
-    # Extract all 3 cameras (head, global, wrist)
-    camera_keys = [
-        f'head_camera_agent{agent_id}',    # [0] Side view
-        f'global_camera_agent{agent_id}',  # [1] Overhead view
-        f'wrist_camera_agent{agent_id}',   # [2] Gripper view
-    ]
+    # Camera mapping following training data convention:
+    # [0] base_0_rgb: per-agent head camera (side view)
+    head_key = f'head_camera_agent{agent_id}'
+    if head_key in sensor_data:
+        img = sensor_data[head_key]['rgb'].squeeze(0).cpu().numpy()
+        if img.shape[0] == 3:
+            img = np.transpose(img, (1, 2, 0))
+        images.append(img)
+    else:
+        raise ValueError(f"Missing required camera: {head_key}")
     
-    for cam_key in camera_keys[:num_cameras]:
-        if cam_key in observation['sensor_data']:
-            img = observation['sensor_data'][cam_key]['rgb'].squeeze(0).numpy()
-            
-            # Convert to HWC format if needed
-            if img.shape[0] == 3:
-                img = np.transpose(img, (1, 2, 0))
-            
-            images.append(img)
+    # [1] left_wrist_0_rgb: global camera (overhead view)
+    global_key = 'head_camera_global'
+    if global_key in sensor_data:
+        img = sensor_data[global_key]['rgb'].squeeze(0).cpu().numpy()
+        if img.shape[0] == 3:
+            img = np.transpose(img, (1, 2, 0))
+        images.append(img)
+    else:
+        # Fallback: use head camera if no global camera
+        images.append(images[0].copy())
+    
+    # [2] right_wrist_0_rgb: wrist camera (gripper view)
+    wrist_key = f'wrist_camera_agent{agent_id}'
+    if wrist_key in sensor_data:
+        img = sensor_data[wrist_key]['rgb'].squeeze(0).cpu().numpy()
+        if img.shape[0] == 3:
+            img = np.transpose(img, (1, 2, 0))
+        images.append(img)
+    else:
+        # Fallback: use head camera if no wrist camera
+        images.append(images[0].copy())
     
     # Stack images: [num_cameras, H, W, 3]
     images = np.array(images)
@@ -188,11 +205,12 @@ class Pi0PolicyWrapper(ActionChunkingWrapper):
     ):
         """Initialize policy wrapper."""
         # Initialize base class
+        # action_repeat=2: sim_freq=20Hz, policy runs at ~10Hz → 2 sim steps per policy step
         super().__init__(
             task_name=task_name,
             device=device,
             action_horizon=50,  # Default, will be updated after loading policy
-            action_repeat=6,
+            action_repeat=2,
         )
         
         self.checkpoint_step = checkpoint_step
@@ -208,37 +226,41 @@ class Pi0PolicyWrapper(ActionChunkingWrapper):
         print(f"Action horizon: {self.action_horizon}")
     
     def _find_checkpoint_dir(self, checkpoint_step: int) -> Path:
-        """Find checkpoint directory."""
-        checkpoint_dir = Path(f'data/outputs') / 'checkpoints' / str(checkpoint_step)
+        """Find checkpoint directory with fallback to best/latest."""
+        # Script runs from robofactory/policy/Pi0/, so go up to robofactory/checkpoints/
+        # Path: ../../checkpoints/{policy_type}/{task_name}_Agent{agent_id}/epoch_{checkpoint_step}
+        base_dir = Path('../../checkpoints') / self.policy_type / f'{self.task_name}_Agent{self.agent_id}'
         
-        # Try to find checkpoint in nested structure
-        if not checkpoint_dir.exists():
-            # Look in dated output structure
-            output_base = Path(f'data/outputs')
-            if output_base.exists():
-                # Find most recent run
-                date_dirs = sorted([d for d in output_base.iterdir() if d.is_dir()], reverse=True)
-                for date_dir in date_dirs:
-                    for run_dir in sorted(date_dir.iterdir(), reverse=True):
-                        candidate = run_dir / 'checkpoints' / str(checkpoint_step)
-                        if candidate.exists():
-                            checkpoint_dir = candidate
-                            break
-                    if checkpoint_dir.exists():
-                        break
+        # Try specified epoch first, then fallback to best, then latest
+        candidates = [
+            base_dir / f'epoch_{checkpoint_step}',
+            base_dir / 'best',
+            base_dir / 'latest',
+        ]
         
-        if not checkpoint_dir.exists():
-            raise FileNotFoundError(f"Checkpoint not found at step {checkpoint_step}")
+        for checkpoint_dir in candidates:
+            if checkpoint_dir.exists():
+                if checkpoint_dir != candidates[0]:
+                    print(f"Note: epoch_{checkpoint_step} not found for Agent{self.agent_id}, using {checkpoint_dir.name}")
+                return checkpoint_dir
         
-        return checkpoint_dir
+        raise FileNotFoundError(f"Checkpoint not found at {base_dir} (tried epoch_{checkpoint_step}, best, latest)")
     
     def load_policy(self, checkpoint_path: str, **kwargs):
         """Load policy from checkpoint."""
         print(f"Loading Pi0 checkpoint from {checkpoint_path}")
         
+        # Get config path based on policy type
+        script_dir = Path(__file__).parent
+        if self.policy_type == 'pi05':
+            config_path = script_dir / 'pi0_policy' / 'config' / 'robot_pi05.yaml'
+        else:
+            config_path = script_dir / 'pi0_policy' / 'config' / 'robot_pi0.yaml'
+        
         # Create policy
         self.policy = Pi0Policy(
             checkpoint_path=checkpoint_path,
+            config_path=str(config_path),
             task_name=self.task_name,
             device=self.device,
         )
@@ -265,27 +287,37 @@ def main(args):
     with open(args.config, 'r') as f:
         config = yaml.safe_load(f)
     
-    env_id = config['env_id']
-    task_name = env_id.replace('-v1', '')
+    # Config uses task_name, construct env_id from it
+    task_name = config.get('task_name', config.get('env_id', '').replace('-rf', ''))
+    env_id = f"{task_name}-rf"
     
     print(f"Evaluating {args.policy_type} on {task_name}")
     print(f"Data num: {args.data_num}, Checkpoint: {args.checkpoint_step}")
     
-    # Get number of agents from config
-    num_agents = config.get('num_agents', 1)
+    # Get number of agents from config (count agents list or use num_agents key)
+    if 'agents' in config:
+        num_agents = len(config['agents'])
+    else:
+        num_agents = config.get('num_agents', 1)
     
-    # Create environment
+    # Create environment with CPU backend for video recording support
     env_kwargs = dict(
         obs_mode=args.obs_mode,
         control_mode=args.control_mode,
         render_mode=args.render_mode,
+        sensor_configs=dict(shader_pack='default'),
+        human_render_camera_configs=dict(shader_pack='default'),
+        viewer_camera_configs=dict(shader_pack='default'),
         num_envs=args.num_envs,
+        sim_backend='cpu',  # CPU backend required for RecordEpisodeMA video recording
+        enable_shadow=True,
     )
     
     env = gym.make(env_id, **env_kwargs)
     
-    # Wrap with video recording
-    record_dir = args.record_dir.format(env_id=env_id)
+    # Wrap with video recording - use unique directory per seed to avoid file locking conflicts
+    record_dir = args.record_dir.format(policy_type=args.policy_type, env_id=env_id)
+    record_dir = f"{record_dir}/seed_{args.seed}"  # Unique per seed for parallel evaluation
     env = RecordEpisodeMA(
         env,
         output_dir=record_dir,
@@ -295,22 +327,37 @@ def main(args):
         max_steps_per_video=args.max_steps,
     )
     
-    # Create motion planners (for invalid action handling)
-    motion_planners = []
-    for agent_id in range(num_agents):
-        planner = PandaArmMotionPlanningSolver(
-            env.unwrapped,
-            agent_idx=agent_id,
-            joint_vel_limits=0.75,
-            joint_acc_limits=0.75,
-        )
-        motion_planners.append(planner)
+    # Initial reset to get agent poses for motion planner
+    env.reset(seed=args.seed)
+    
+    # Get agent base poses for motion planner
+    env_unwrapped = env.unwrapped
+    is_multi_agent = num_agents > 1
+    if is_multi_agent:
+        agents_list = env_unwrapped.agent.agents
+    else:
+        agents_list = [env_unwrapped.agent]
+    base_pose = [agent.robot.pose for agent in agents_list]
+    
+    # Create motion planner (for invalid action handling)
+    planner = PandaArmMotionPlanningSolver(
+        env,
+        debug=False,
+        vis=False,
+        base_pose=base_pose,
+        visualize_target_grasp_pose=False,
+        print_env_info=False,
+        joint_vel_limits=0.75,
+        joint_acc_limits=0.75,
+        is_multi_agent=is_multi_agent,
+    )
     
     # Load policies for each agent
+    # Use env_id (with -rf suffix) since checkpoint directories use that format
     policies = []
     for agent_id in range(num_agents):
         policy = Pi0PolicyWrapper(
-            task_name=task_name,
+            task_name=env_id,  # Use env_id (e.g., "LiftBarrier-rf") for checkpoint path
             checkpoint_step=args.checkpoint_step,
             data_num=args.data_num,
             agent_id=agent_id,
@@ -341,49 +388,80 @@ def main(args):
         episode_reward = 0
         step_count = 0
         done = False
+        episode_success = False  # Track if success was ever achieved during episode
         
         while not done and step_count < args.max_steps:
-            # Get actions from each agent's policy
-            actions = []
+            # Get action sequences from each agent's policy
+            # Each sequence contains action_repeat actions to execute consecutively
+            action_sequences = {}
             
-            for agent_id in range(num_agents):
-                # Extract observation for this agent
-                agent_pos = obs['agent']['qpos'][agent_id].cpu().numpy()
+            if is_multi_agent:
+                for agent_id in range(num_agents):
+                    agent_uid = f'panda-{agent_id}'
+                    agent_pos = obs['agent'][agent_uid]['qpos'].squeeze(0).cpu().numpy()
+                    
+                    model_input = get_model_input(obs, agent_pos, agent_id)
+                    
+                    # Update policy observation buffer
+                    policies[agent_id].update_obs(model_input)
+                    
+                    # Get action sequence (list of action_repeat actions)
+                    action_sequences[agent_uid] = policies[agent_id].get_action(model_input)
+            else:
+                agent_pos = obs['agent']['qpos'].squeeze(0).cpu().numpy()
+                model_input = get_model_input(obs, agent_pos, 0)
+                policies[0].update_obs(model_input)
+                action_sequences['single'] = policies[0].get_action(model_input)
+            
+            # Execute all actions in the sequence (action_repeat steps per policy prediction)
+            num_repeat = len(list(action_sequences.values())[0])
+            for action_idx in range(num_repeat):
+                if done or step_count >= args.max_steps:
+                    break
+                    
+                # Collect current action for each agent
+                if is_multi_agent:
+                    actions = {}
+                    for agent_id in range(num_agents):
+                        agent_uid = f'panda-{agent_id}'
+                        actions[agent_uid] = action_sequences[agent_uid][action_idx]
+                else:
+                    actions = action_sequences['single'][action_idx]
                 
-                model_input = get_model_input(obs, agent_pos, agent_id)
+                # Execute action
+                obs, reward, terminated, truncated, info = env.step(actions)
                 
-                # Update policy observation buffer
-                policies[agent_id].update_obs(model_input)
+                # Convert tensors to Python types (for GPU backend compatibility)
+                if isinstance(terminated, torch.Tensor):
+                    terminated = terminated.item()
+                if isinstance(truncated, torch.Tensor):
+                    truncated = truncated.item()
+                if isinstance(reward, torch.Tensor):
+                    reward = reward.item()
                 
-                # Get action
-                action_sequence = policies[agent_id].get_action(model_input)
-                action = action_sequence[0]  # Take first action from sequence
+                # Check success every step (success is a transient condition)
+                step_success = info.get('success', False)
+                if isinstance(step_success, torch.Tensor):
+                    step_success = step_success.item()
+                if step_success:
+                    episode_success = True  # Remember success was achieved
                 
-                actions.append(action)
-            
-            # Stack actions for all agents
-            actions = np.array(actions)
-            
-            # Execute action
-            obs, reward, terminated, truncated, info = env.step(actions)
-            
-            done = terminated or truncated
-            episode_reward += reward
-            step_count += 1
-            
-            if verbose:
-                print(f"Step {step_count}: reward={reward:.4f}, done={done}")
+                done = terminated or truncated
+                episode_reward += reward
+                step_count += 1
+                
+                if verbose:
+                    print(f"Step {step_count}: reward={reward:.4f}, done={done}, success={step_success}")
         
-        # Episode results
-        success = info.get('success', False)
-        if success:
+        # Episode results - use tracked success (True if success ever achieved)
+        if episode_success:
             success_count += 1
         
-        episode_rewards.append(episode_reward)
+        episode_rewards.append(float(episode_reward))
         episode_lengths.append(step_count)
         
         print(f"Episode {episode_idx + 1} finished:")
-        print(f"  Success: {success}")
+        print(f"  Success: {episode_success}")
         print(f"  Reward: {episode_reward:.4f}")
         print(f"  Length: {step_count}")
         print(f"  Success rate so far: {success_count}/{episode_idx + 1} ({100*success_count/(episode_idx+1):.1f}%)")

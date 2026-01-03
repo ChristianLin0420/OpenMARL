@@ -15,6 +15,12 @@ import logging
 import torch.distributed as dist
 from typing import Optional, Dict, Tuple, List
 
+# Disable torch.compile/dynamo to avoid issues with patched functions
+# This is particularly important for evaluation where we monkey-patch
+# the image format conversion
+import torch._dynamo
+torch._dynamo.config.suppress_errors = True
+
 try:
     # Import from openpi (treated as external dependency)
     from openpi.models_pytorch.pi0_pytorch import PI0Pytorch
@@ -56,17 +62,22 @@ class Pi0Model(nn.Module):
         super().__init__()
         
         self.model_variant = model_variant
-        self.action_dim = action_dim
+        self.action_dim = action_dim  # Actual action dim for output (e.g., 8)
         self.action_horizon = action_horizon
         self.device = device
         self.pytorch_training_precision = pytorch_training_precision
         
+        # Pretrained Pi0 models use 32-dim actions internally
+        # We must use 32 for model config to match pretrained weights
+        pretrained_action_dim = 32
+        
         # Create Pi0 config (following openpi's Pi0Config)
+        # Use pretrained_action_dim=32 to match pretrained weights
         config = Pi0Config(
             dtype=str(torch_dtype).split('.')[-1],  # "bfloat16" or "float32"
             paligemma_variant=paligemma_variant,
             action_expert_variant=action_expert_variant,
-            action_dim=action_dim,
+            action_dim=pretrained_action_dim,  # Must be 32 to match pretrained weights
             action_horizon=action_horizon,
             max_token_len=max_token_len or (200 if model_variant == "pi05" else 48),
             pi05=(model_variant == "pi05"),
@@ -78,7 +89,8 @@ class Pi0Model(nn.Module):
         print(f"Initializing {model_variant} model with config:")
         print(f"  - paligemma_variant: {paligemma_variant}")
         print(f"  - action_expert_variant: {action_expert_variant}")
-        print(f"  - action_dim: {action_dim}")
+        print(f"  - action_dim (internal): {pretrained_action_dim}")
+        print(f"  - action_dim (output): {action_dim}")
         print(f"  - action_horizon: {action_horizon}")
         print(f"  - max_token_len: {config.max_token_len}")
         print(f"  - precision: {pytorch_training_precision}")
@@ -132,10 +144,20 @@ class Pi0Model(nn.Module):
         original_get_image_features = paligemma.model.get_image_features
         
         def patched_get_image_features(pixel_values, **kwargs):
-            # Convert from NHWC to NCHW if needed
-            # Check if last dim is small (channels) indicating NHWC format
-            if pixel_values.ndim == 4 and pixel_values.shape[-1] in [1, 3, 4]:  # [B, H, W, C]
-                pixel_values = pixel_values.permute(0, 3, 1, 2)  # -> [B, C, H, W]
+            # Handle various input formats and convert to NCHW
+            if pixel_values.ndim == 3:
+                # 3D tensor: either [H, W, C] or [C, H, W]
+                if pixel_values.shape[-1] in [1, 3, 4]:  # [H, W, C]
+                    pixel_values = pixel_values.permute(2, 0, 1).unsqueeze(0)
+                elif pixel_values.shape[0] in [1, 3, 4]:  # [C, H, W]
+                    pixel_values = pixel_values.unsqueeze(0)
+                else:
+                    pixel_values = pixel_values.unsqueeze(0)
+            elif pixel_values.ndim == 4:
+                # 4D tensor: either [B, H, W, C] or [B, C, H, W]
+                if pixel_values.shape[-1] in [1, 3, 4] and pixel_values.shape[1] > 4:  # [B, H, W, C]
+                    pixel_values = pixel_values.permute(0, 3, 1, 2)  # -> [B, C, H, W]
+            
             return original_get_image_features(pixel_values, **kwargs)
         
         paligemma.model.get_image_features = patched_get_image_features

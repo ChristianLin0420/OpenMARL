@@ -59,7 +59,7 @@ training:
   val_every: 10
   
   # Checkpointing (following openpi pattern)
-  checkpoint_every: 10
+  checkpoint_every: 5
   save_interval: 5000  # Save every N steps (openpi convention)
   resume: true
 
@@ -78,7 +78,7 @@ val_dataloader:
 
 # Logging configuration (following openpi's train_pytorch.py)
 logging:
-  project: "test"
+  project: "openmarl"
   mode: "online"  # "online", "offline", or "disabled"
   name: "${task_name}_${exp_name}_Agent${agent_id}"
   tags: ["pi0", "${task_name}", "Agent${agent_id}"]
