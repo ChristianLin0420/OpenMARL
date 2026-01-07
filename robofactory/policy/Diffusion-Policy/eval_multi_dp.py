@@ -84,17 +84,18 @@ class Args:
     shader: str = "default"
     """Change shader used for all cameras in the environment for rendering. Default is 'minimal' which is very fast. Can also be 'rt' for ray tracing and generating photo-realistic renders. Can also be 'rt-fast' for a faster but lower quality ray-traced renderer"""
 
-    record_dir: Optional[str] = './testvideo/{env_id}'
-    """Directory to save recordings"""
-
     pause: Annotated[bool, tyro.conf.arg(aliases=["-p"])] = False
     """If using human render mode, auto pauses the simulation upon loading"""
 
     quiet: bool = False
     """Disable verbose output."""
 
-    seed: Annotated[Optional[Union[int, List[int]]], tyro.conf.arg(aliases=["-s"])] = 10000
-    """Seed(s) for random actions and simulator. Can be a single integer or a list of integers. Default is None (no seeds)"""
+    # Seed arguments - support both single seed and range
+    seed: Annotated[Optional[int], tyro.conf.arg(aliases=["-s"])] = 1000
+    """Starting seed for evaluation"""
+    
+    num_episodes: int = 1
+    """Number of episodes to run (seeds will be seed, seed+1, ..., seed+num_episodes-1)"""
 
     data_num: int = 100
     """The number of episode data used for training the policy"""
@@ -102,7 +103,7 @@ class Args:
     checkpoint_num: int = 300
     """The number of training epoch of the checkpoint"""
 
-    record_dir: Optional[str] = './eval_video/{env_id}'
+    record_dir: Optional[str] = './eval_video/diffusion_policy/{env_id}'
     """Directory to save recordings"""
 
     max_steps: int = 250
@@ -141,6 +142,10 @@ class DP:
     def update_obs(self, observation):
         self.runner.update_obs(observation)
     
+    def reset(self):
+        """Reset the observation buffer for a new episode"""
+        self.runner = DPRunner(output_dir=None)
+    
     def get_action(self, observation=None):
         action = self.runner.get_action(self.policy, observation)
         return action
@@ -157,96 +162,47 @@ def get_model_input(observation, agent_pos, agent_id, is_multi_agent=True):
         agent_pos=agent_pos,
     )
 
-def main(args: Args):
-    np.set_printoptions(suppress=True, precision=5)
-    verbose = not args.quiet
-    if isinstance(args.seed, int):
-        args.seed = [args.seed]
-    if args.seed is not None:
-        np.random.seed(args.seed[0])
-    parallel_in_single_scene = args.render_mode == "human"
-    if args.render_mode == "human" and args.obs_mode in ["sensor_data", "rgb", "rgbd", "depth", "point_cloud"]:
-        print("Disabling parallel single scene/GUI render as observation mode is a visual one. Change observation mode to state or state_dict to see a parallel env render")
-        parallel_in_single_scene = False
-    if args.render_mode == "human" and args.num_envs == 1:
-        parallel_in_single_scene = False
-    env_id = args.env_id
-    if env_id == "":
-        with open(args.config, "r") as f:
-            config = yaml.safe_load(f)
-            env_id = config['task_name'] + '-rf'
-    env_kwargs = dict(
-        config=args.config, 
-        obs_mode=args.obs_mode,
-        reward_mode=args.reward_mode,
-        control_mode=args.control_mode,
-        render_mode=args.render_mode,
-        sensor_configs=dict(shader_pack=args.shader),
-        human_render_camera_configs=dict(shader_pack=args.shader),
-        viewer_camera_configs=dict(shader_pack=args.shader),
-        num_envs=args.num_envs,
-        sim_backend=args.sim_backend,
-        enable_shadow=True,
-        parallel_in_single_scene=parallel_in_single_scene,
-    )
-    if args.robot_uids is not None:
-        env_kwargs["robot_uids"] = tuple(args.robot_uids.split(","))
-    env: BaseEnv = gym.make(env_id, **env_kwargs)
-
-    record_dir = args.record_dir + '/' + str(args.seed) + '_' + str(args.data_num) + '_' + str(args.checkpoint_num)
-    if record_dir:
-        record_dir = record_dir.format(env_id=env_id)
-        env = RecordEpisodeMA(env, record_dir, info_on_video=False, save_trajectory=False, max_steps_per_video=30000)
-    raw_obs, _ = env.reset(seed=args.seed[0])
-
-    # Check if it's multi-agent environment
-    env_unwrapped = env.unwrapped if hasattr(env, 'unwrapped') else env
-    is_multi_agent = hasattr(env_unwrapped, 'agent') and hasattr(env_unwrapped.agent, 'agents')
-
-    if is_multi_agent:
-        agents_list = env_unwrapped.agent.agents
-    else:
-        agents_list = [env_unwrapped.agent]
-
-    base_pose = [agent.robot.pose for agent in agents_list]
-
-    planner = PandaArmMotionPlanningSolver(
-        env,
-        debug=False,
-        vis=verbose,
-        base_pose=base_pose,
-        visualize_target_grasp_pose=verbose,
-        print_env_info=False,
-        is_multi_agent=is_multi_agent
-    )
-
-    # Load multi dp policy
+def run_episode(env, dp_models, planner, seed, args, env_id, verbose=False):
+    """Run a single evaluation episode and return success status"""
+    is_multi_agent = planner.is_multi_agent
     agent_num = planner.agent_num
-    dp_models = []
-    for i in range(agent_num):
-        dp_models.append(DP(env_id, args.checkpoint_num, args.data_num, id=i))
-
-    if args.seed is not None and env.action_space is not None:
-        env.action_space.seed(args.seed[0])
-    # if args.render_mode is not None:
-    #     viewer = env.render()
-    #     if isinstance(viewer, sapien.utils.Viewer):
-    #         viewer.paused = args.pause
-    #     env.render()
+    
+    # Subsample TOPP trajectory to reduce video frames
+    # Execute every Nth step instead of all interpolated steps
+    TOPP_SUBSAMPLE = 10  # Execute every 10th TOPP step (reduces frames by 10x)
+    
+    # Reset environment with new seed
+    raw_obs, _ = env.reset(seed=seed)
+    
+    # Reset all DP models for new episode
+    for model in dp_models:
+        model.reset()
+    
+    # Reset planner gripper states
+    planner.gripper_state = [1] * agent_num
+    
+    if env.action_space is not None:
+        env.action_space.seed(seed)
+    
+    # Initialize observations for all agents
     for id in range(agent_num):
-        if planner.is_multi_agent:
+        if is_multi_agent:
             initial_qpos = raw_obs['agent'][f'panda-{id}']['qpos'].squeeze(0)[:-2].cpu().numpy()
         else:
             initial_qpos = raw_obs['agent']['qpos'].squeeze(0)[:-2].cpu().numpy()
         initial_qpos = np.append(initial_qpos, planner.gripper_state[id])
-        obs = get_model_input(raw_obs, initial_qpos, id, planner.is_multi_agent)
+        obs = get_model_input(raw_obs, initial_qpos, id, is_multi_agent)
         dp_models[id].update_obs(obs)
+    
     cnt = 0
+    total_steps = 0
     while True:
         if verbose:
-            print("Iteration:", cnt)
+            print(f"Iteration: {cnt}, Total steps: {total_steps}")
         cnt = cnt + 1
-        if cnt > args.max_steps:
+        # Exit based on ACTUAL env.step() calls, not iterations
+        # Each iteration does 6 actions × ~10 TOPP steps = ~60 env.step() calls
+        if total_steps >= args.max_steps:
             break
         action_dict = defaultdict(list)
         action_step_dict = defaultdict(list)
@@ -256,7 +212,7 @@ def main(args: Args):
                 now_action = action_list[i]
                 raw_obs = env.get_obs()
                 if i == 0:
-                    if planner.is_multi_agent:
+                    if is_multi_agent:
                         current_qpos = raw_obs['agent'][f'panda-{id}']['qpos'].squeeze(0)[:-2].cpu().numpy()
                     else:
                         current_qpos = raw_obs['agent']['qpos'].squeeze(0)[:-2].cpu().numpy()
@@ -264,22 +220,32 @@ def main(args: Args):
                     current_qpos = action_list[i - 1][:-1]
                 path = np.vstack((current_qpos, now_action[:-1]))
                 try:
-                    times, position, right_vel, acc, duration = planner.planner[id].TOPP(path, 0.05, verbose=True)
+                    times, position, right_vel, acc, duration = planner.planner[id].TOPP(path, 0.05, verbose=False)
                 except Exception as e:
-                    print(f"Error occurred: {e}")
+                    if verbose:
+                        print(f"Error occurred: {e}")
                     action_now = np.hstack([current_qpos, now_action[-1]])
                     action_dict[f'panda-{id}'].append(action_now)
                     action_step_dict[f'panda-{id}'].append(1)
                     continue
+                
                 n_step = position.shape[0]
-                action_step_dict[f'panda-{id}'].append(n_step)
                 gripper_state = now_action[-1]
+                
                 if n_step == 0:
                     action_now = np.hstack([current_qpos, gripper_state])
                     action_dict[f'panda-{id}'].append(action_now)
-                for j in range(n_step):
-                    true_action = np.hstack([position[j], gripper_state])
-                    action_dict[f'panda-{id}'].append(true_action)
+                    action_step_dict[f'panda-{id}'].append(1)
+                else:
+                    # Subsample TOPP trajectory: take every Nth step + always include last step
+                    subsampled_indices = list(range(0, n_step, TOPP_SUBSAMPLE))
+                    if (n_step - 1) not in subsampled_indices:
+                        subsampled_indices.append(n_step - 1)
+                    
+                    action_step_dict[f'panda-{id}'].append(len(subsampled_indices))
+                    for j in subsampled_indices:
+                        true_action = np.hstack([position[j], gripper_state])
+                        action_dict[f'panda-{id}'].append(true_action)
         
         start_idx = []
         for id in range(agent_num):
@@ -299,8 +265,7 @@ def main(args: Args):
                     now_step = min(j, action_step_dict['panda-0'][i] - 1)
                     true_action = action_dict['panda-0'][start_idx[0] + now_step]
                 observation, reward, terminated, truncated, info = env.step(true_action)
-                # if verbose:
-                #     env.render_human()
+                total_steps += 1
             if verbose:
                 print(true_action)
                 print("max_step", max_step)
@@ -316,18 +281,133 @@ def main(args: Args):
                 dp_models[id].update_obs(obs)
         if verbose:
             print("info", info)
-        # if args.render_mode is not None:
-        #     env.render()
         if info['success'] == True:
-            env.close()
-            if record_dir:
-                print(f"Saving video to {record_dir}")
-            print("success")
-            return
+            if verbose:
+                print(f"Success after {total_steps} env steps")
+            return True
+    if verbose:
+        print(f"Failed after {total_steps} env steps")
+    return False
+
+def main(args: Args):
+    np.set_printoptions(suppress=True, precision=5)
+    verbose = not args.quiet
+    
+    if args.seed is not None:
+        np.random.seed(args.seed)
+    
+    parallel_in_single_scene = args.render_mode == "human"
+    if args.render_mode == "human" and args.obs_mode in ["sensor_data", "rgb", "rgbd", "depth", "point_cloud"]:
+        print("Disabling parallel single scene/GUI render as observation mode is a visual one. Change observation mode to state or state_dict to see a parallel env render")
+        parallel_in_single_scene = False
+    if args.render_mode == "human" and args.num_envs == 1:
+        parallel_in_single_scene = False
+    
+    env_id = args.env_id
+    if env_id == "":
+        with open(args.config, "r") as f:
+            config = yaml.safe_load(f)
+            env_id = config['task_name'] + '-rf'
+    
+    print(f"=== Diffusion Policy Evaluation ===")
+    print(f"Task: {env_id}")
+    print(f"Seeds: {args.seed} to {args.seed + args.num_episodes - 1} ({args.num_episodes} episodes)")
+    print(f"Max steps per episode: {args.max_steps}")
+    print(f"===================================")
+    
+    # Create environment once
+    env_kwargs = dict(
+        config=args.config, 
+        obs_mode=args.obs_mode,
+        reward_mode=args.reward_mode,
+        control_mode=args.control_mode,
+        render_mode=args.render_mode,
+        sensor_configs=dict(shader_pack=args.shader),
+        human_render_camera_configs=dict(shader_pack=args.shader),
+        viewer_camera_configs=dict(shader_pack=args.shader),
+        num_envs=args.num_envs,
+        sim_backend=args.sim_backend,
+        enable_shadow=True,
+        parallel_in_single_scene=parallel_in_single_scene,
+    )
+    if args.robot_uids is not None:
+        env_kwargs["robot_uids"] = tuple(args.robot_uids.split(","))
+    
+    env: BaseEnv = gym.make(env_id, **env_kwargs)
+    
+    # Initial reset to setup the environment
+    raw_obs, _ = env.reset(seed=args.seed)
+    
+    # Check if it's multi-agent environment
+    env_unwrapped = env.unwrapped if hasattr(env, 'unwrapped') else env
+    is_multi_agent = hasattr(env_unwrapped, 'agent') and hasattr(env_unwrapped.agent, 'agents')
+    
+    if is_multi_agent:
+        agents_list = env_unwrapped.agent.agents
+    else:
+        agents_list = [env_unwrapped.agent]
+    
+    base_pose = [agent.robot.pose for agent in agents_list]
+    
+    # Create planner once
+    planner = PandaArmMotionPlanningSolver(
+        env,
+        debug=False,
+        vis=verbose,
+        base_pose=base_pose,
+        visualize_target_grasp_pose=verbose,
+        print_env_info=False,
+        is_multi_agent=is_multi_agent
+    )
+    
+    # Load models once
+    agent_num = planner.agent_num
+    print(f"Loading {agent_num} DP model(s)...")
+    dp_models = []
+    for i in range(agent_num):
+        dp_models.append(DP(env_id, args.checkpoint_num, args.data_num, id=i))
+    print("Models loaded!")
+    
+    # Run evaluation episodes
+    results = []
+    success_count = 0
+    
+    for episode_idx in range(args.num_episodes):
+        current_seed = args.seed + episode_idx
+        
+        # Setup recording for this episode
+        if args.record_dir:
+            record_dir = args.record_dir.format(env_id=env_id)
+            record_dir = f"{record_dir}/[{current_seed}]_{args.data_num}_{args.checkpoint_num}"
+            # Wrap env with new recorder for this episode
+            record_env = RecordEpisodeMA(env, record_dir, info_on_video=False, save_trajectory=False, max_steps_per_video=args.max_steps)
+        else:
+            record_env = env
+        
+        # Run episode
+        success = run_episode(record_env, dp_models, planner, current_seed, args, env_id, verbose=verbose)
+        
+        # Close recorder to save video
+        if args.record_dir and hasattr(record_env, '_video_recorder'):
+            record_env.close()
+        
+        if success:
+            success_count += 1
+            print(f"Episode {episode_idx + 1}/{args.num_episodes} (seed={current_seed}): success")
+        else:
+            print(f"Episode {episode_idx + 1}/{args.num_episodes} (seed={current_seed}): failed")
+        
+        results.append((current_seed, 1 if success else 0))
+    
+    # Print summary
+    print(f"\n=== Results ===")
+    print(f"Success: {success_count}/{args.num_episodes} ({100*success_count/args.num_episodes:.2f}%)")
+    
+    # Print results in format that bash script can parse
+    for seed, success in results:
+        print(f"RESULT:{seed},{success}")
+    
     env.close() 
-    if record_dir:
-        print(f"Saving video to {record_dir}")
-    print("failed")
 
 if __name__ == "__main__":
     parsed_args = tyro.cli(Args)

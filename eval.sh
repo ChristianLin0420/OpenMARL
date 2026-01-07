@@ -26,7 +26,7 @@ DATA_NUM=160
 CHECKPOINT_NUM=500
 DEBUG_MODE=0
 SEED_START=1000
-NUM_EVAL=20
+NUM_EVAL=16
 MAX_STEPS=1000
 ALL_TASKS=false
 RESULTS_DIR="evaluation_results"
@@ -281,7 +281,9 @@ eval_diffusion_policy() {
         "$DATA_NUM" \
         "$CHECKPOINT_NUM" \
         "$DEBUG_MODE" \
-        "$task"
+        "$task" \
+        "$MAX_STEPS" \
+        "$NUM_EVAL"
     
     cd ..
 }
@@ -317,7 +319,9 @@ eval_openvla() {
         "$DATA_NUM" \
         "$CHECKPOINT_NUM" \
         "$DEBUG_MODE" \
-        "$task"
+        "$task" \
+        "$MAX_STEPS" \
+        "$NUM_EVAL"
     
     cd ..
     return 0

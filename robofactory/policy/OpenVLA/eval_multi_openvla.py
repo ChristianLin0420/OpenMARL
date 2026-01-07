@@ -72,7 +72,7 @@ def parse_args():
     parser.add_argument(
         '--record_dir',
         type=str,
-        default='./eval_video/{env_id}',
+        default='./eval_video/openvla/{env_id}',
         help='Directory to save evaluation videos'
     )
     parser.add_argument(
