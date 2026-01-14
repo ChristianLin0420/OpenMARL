@@ -150,11 +150,40 @@ class OpenVLAWorkspace(BaseVLAWorkspace):
         return train_dataset, val_dataset
     
     def _setup_action_statistics(self, dataset: RobotRLDSDataset):
-        """Setup action statistics for denormalization."""
+        """Setup action statistics for denormalization.
+        
+        FIX: Now also stores and passes min/max from actual data for proper
+        8-DOF tokenization/detokenization.
+        """
         stats = dataset.get_statistics()
         if 'action' in stats:
             action_mean = stats['action']['mean']
             action_std = stats['action']['std']
+            
+            # FIX: Also get min/max from dataset if available, otherwise compute from data
+            # First, try to get from statistics.json
+            if 'min' in stats['action'] and 'max' in stats['action']:
+                action_min = stats['action']['min']
+                action_max = stats['action']['max']
+            else:
+                # Compute min/max by iterating through samples
+                if self._is_main_process:
+                    print("Computing action min/max from dataset...")
+                all_actions = []
+                for i in range(min(1000, len(dataset))):  # Sample up to 1000
+                    sample = dataset[i]
+                    all_actions.append(sample['action'].numpy())
+                all_actions = np.stack(all_actions)
+                action_min = all_actions.min(axis=0).astype(np.float32)
+                action_max = all_actions.max(axis=0).astype(np.float32)
+            
+            # Store for checkpoint saving
+            self._action_stats = {
+                'mean': action_mean,
+                'std': action_std,
+                'min': action_min,
+                'max': action_max,
+            }
             
             # Update model's action_dim based on actual data
             data_action_dim = len(action_mean)
@@ -163,10 +192,18 @@ class OpenVLAWorkspace(BaseVLAWorkspace):
                     print(f"Updating action_dim from {self.model.action_dim} to {data_action_dim}")
                 self.model.action_dim = data_action_dim
             
-            self.model.set_action_statistics(mean=action_mean, std=action_std)
+            # FIX: Pass min/max to model for proper tokenization
+            self.model.set_action_statistics(
+                mean=action_mean, 
+                std=action_std,
+                action_min=action_min,
+                action_max=action_max,
+            )
             
             if self._is_main_process:
                 print(f"Loaded {len(dataset)} samples, action_dim={data_action_dim}")
+                print(f"  Action min: {action_min}")
+                print(f"  Action max: {action_max}")
     
     def _compute_loss(self, batch: Dict[str, Any]) -> torch.Tensor:
         """Compute training loss using OpenVLA model."""
@@ -663,6 +700,21 @@ class OpenVLAWorkspace(BaseVLAWorkspace):
         }
         with open(checkpoint_dir / 'training_state.json', 'w') as f:
             json.dump(metadata, f, indent=2)
+        
+        # FIX: Save action statistics for proper inference
+        # This ensures the model can properly detokenize actions during evaluation
+        if hasattr(self, '_action_stats'):
+            action_stats_path = checkpoint_dir / 'action_stats.json'
+            action_stats = {
+                'action_mean': self._action_stats['mean'].tolist(),
+                'action_std': self._action_stats['std'].tolist(),
+                'action_min': self._action_stats['min'].tolist(),
+                'action_max': self._action_stats['max'].tolist(),
+                'action_dim': len(self._action_stats['mean']),
+            }
+            with open(action_stats_path, 'w') as f:
+                json.dump(action_stats, f, indent=2)
+            print(f"Saved action statistics to {action_stats_path}")
             
     def _load_checkpoint_if_exists(self) -> bool:
         """Load the latest checkpoint if it exists."""

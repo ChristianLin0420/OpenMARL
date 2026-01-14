@@ -58,7 +58,7 @@ training:
   
   # Validation
   val_split: 0.1
-  val_every: 10
+  val_every: 5
   
   # Checkpointing (following openpi pattern)
   checkpoint_every: 5
@@ -80,7 +80,7 @@ val_dataloader:
 
 # Logging configuration (following openpi's train_pytorch.py)
 logging:
-  project: "openmarl"
+  project: "openmarl-train"
   mode: "online"  # "online", "offline", or "disabled"
   name: "${task_name}_${exp_name}_Agent${agent_id}"
   tags: ["pi05", "${task_name}", "Agent${agent_id}"]

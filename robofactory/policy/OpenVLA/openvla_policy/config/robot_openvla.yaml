@@ -88,7 +88,7 @@ val_dataloader:
 
 # Logging configuration
 logging:
-  project: "openmarl"
+  project: "openmarl-train"
   mode: "online"
   name: "${task_name}_${exp_name}_Agent${agent_id}"
   tags: ["${name}", "${task_name}", "${exp_name}", "Agent${agent_id}"]

@@ -398,7 +398,13 @@ def main(args):
             if is_multi_agent:
                 for agent_id in range(num_agents):
                     agent_uid = f'panda-{agent_id}'
-                    agent_pos = obs['agent'][agent_uid]['qpos'].squeeze(0).cpu().numpy()
+                    qpos = obs['agent'][agent_uid]['qpos'].squeeze(0).cpu().numpy()
+                    
+                    # Convert 9-dim qpos to 8-dim state (7 joints + 1 gripper command)
+                    # Panda qpos: [j1, j2, j3, j4, j5, j6, j7, gripper_left, gripper_right]
+                    # Training data: [j1, j2, j3, j4, j5, j6, j7, gripper_command]
+                    # Remove 2 gripper fingers, append planner's gripper command state
+                    agent_pos = np.append(qpos[:-2], planner.gripper_state[agent_id])
                     
                     model_input = get_model_input(obs, agent_pos, agent_id)
                     
@@ -408,7 +414,10 @@ def main(args):
                     # Get action sequence (list of action_repeat actions)
                     action_sequences[agent_uid] = policies[agent_id].get_action(model_input)
             else:
-                agent_pos = obs['agent']['qpos'].squeeze(0).cpu().numpy()
+                qpos = obs['agent']['qpos'].squeeze(0).cpu().numpy()
+                # Convert 9-dim qpos to 8-dim state (7 joints + 1 gripper command)
+                # Remove 2 gripper fingers, append planner's gripper command state
+                agent_pos = np.append(qpos[:-2], planner.gripper_state[0])
                 model_input = get_model_input(obs, agent_pos, 0)
                 policies[0].update_obs(model_input)
                 action_sequences['single'] = policies[0].get_action(model_input)

@@ -41,10 +41,13 @@ class OpenVLAPolicy(BaseVLAPolicy):
         """
         Initialize policy from checkpoint.
         
+        FIX: Now loads full action statistics (mean, std, min, max) from 
+        checkpoint's action_stats.json for proper 8-DOF detokenization.
+        
         Args:
             checkpoint_path: Path to model checkpoint
             device: Device to run inference on
-            action_statistics: Dictionary with action mean/std for denormalization
+            action_statistics: Dictionary with action mean/std/min/max for denormalization
             action_dim: Dimension of action space
         """
         super().__init__(device=device, action_dim=action_dim)
@@ -57,15 +60,63 @@ class OpenVLAPolicy(BaseVLAPolicy):
         )
         self.model.eval()
         
-        # Set action statistics
+        # FIX: Load action statistics from checkpoint directory if not provided
+        if action_statistics is None:
+            action_statistics = self._load_action_statistics(checkpoint_path)
+        
+        # FIX: Set action statistics with min/max for proper detokenization
         if action_statistics is not None:
+            mean = np.array(action_statistics.get('mean', action_statistics.get('action_mean', [])))
+            std = np.array(action_statistics.get('std', action_statistics.get('action_std', [])))
+            action_min = action_statistics.get('min', action_statistics.get('action_min'))
+            action_max = action_statistics.get('max', action_statistics.get('action_max'))
+            
+            if action_min is not None:
+                action_min = np.array(action_min)
+            if action_max is not None:
+                action_max = np.array(action_max)
+            
             self.model.set_action_statistics(
-                mean=action_statistics['mean'],
-                std=action_statistics['std'],
+                mean=mean,
+                std=std,
+                action_min=action_min,
+                action_max=action_max,
             )
+            print(f"Loaded action statistics: dim={len(mean)}")
+        else:
+            print("WARNING: No action statistics found! Using default bridge_orig stats.")
         
         # Default instruction (can be updated)
         self._instruction = None
+    
+    def _load_action_statistics(self, checkpoint_path: str) -> Optional[Dict]:
+        """
+        Load action statistics from checkpoint directory.
+        
+        Searches for action_stats.json in the checkpoint directory.
+        
+        Args:
+            checkpoint_path: Path to model checkpoint directory
+            
+        Returns:
+            Dictionary with action statistics or None if not found
+        """
+        checkpoint_dir = Path(checkpoint_path)
+        
+        # Look for action_stats.json in checkpoint directory
+        possible_paths = [
+            checkpoint_dir / "action_stats.json",
+            checkpoint_dir.parent / "action_stats.json",
+            checkpoint_dir.parent.parent / "action_stats.json",
+        ]
+        
+        for stats_file in possible_paths:
+            if stats_file.exists():
+                print(f"Found action statistics at {stats_file}")
+                with open(stats_file, 'r') as f:
+                    return json.load(f)
+        
+        return None
     
     def predict_action(
         self,

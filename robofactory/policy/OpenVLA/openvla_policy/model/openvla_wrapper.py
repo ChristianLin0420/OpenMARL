@@ -140,13 +140,24 @@ class OpenVLAModel(nn.Module):
         if self._is_logging_rank:
             self.model.print_trainable_parameters()
     
-    def set_action_statistics(self, mean: np.ndarray, std: np.ndarray):
+    def set_action_statistics(
+        self, 
+        mean: np.ndarray, 
+        std: np.ndarray,
+        action_min: Optional[np.ndarray] = None,
+        action_max: Optional[np.ndarray] = None,
+    ):
         """
         Set action statistics for normalization/denormalization.
         
+        FIX: Now accepts optional action_min/action_max for proper 8-DOF handling.
+        Uses actual data min/max if provided, otherwise estimates from mean ± 3*std.
+        
         Args:
-            mean: Mean values for actions
-            std: Standard deviation values for actions
+            mean: Mean values for actions (8-DOF)
+            std: Standard deviation values for actions (8-DOF)
+            action_min: Optional actual minimum values from dataset
+            action_max: Optional actual maximum values from dataset
         """
         self.action_dim = len(mean)  # Update action_dim based on statistics
         
@@ -159,13 +170,30 @@ class OpenVLAModel(nn.Module):
             dtype=self.torch_dtype
         )
         
-        # Compute approximate min/max for tokenization (mean ± 3*std)
-        self.action_min = self.action_mean - 3 * self.action_std
-        self.action_max = self.action_mean + 3 * self.action_std
+        # Use actual min/max if provided, otherwise estimate from mean ± 3*std
+        if action_min is not None and action_max is not None:
+            self.action_min = torch.from_numpy(action_min).to(
+                device=self.device, dtype=self.torch_dtype
+            )
+            self.action_max = torch.from_numpy(action_max).to(
+                device=self.device, dtype=self.torch_dtype
+            )
+        else:
+            # Fallback: estimate from mean ± 3*std
+            self.action_min = self.action_mean - 3 * self.action_std
+            self.action_max = self.action_mean + 3 * self.action_std
         
         if self._is_logging_rank:
-            print(f"Action statistics set: dim={self.action_dim}, "
-                  f"mean={mean[:3]}..., std={std[:3]}...")
+            print(f"Action statistics set: dim={self.action_dim}")
+            print(f"  mean: {mean}")
+            print(f"  std: {std}")
+<<<<<<< Current (Your changes)
+            print(f"  min: {self.action_min.cpu().float().numpy()}")
+            print(f"  max: {self.action_max.cpu().float().numpy()}")
+=======
+            print(f"  min: {self.action_min.cpu().numpy()}")
+            print(f"  max: {self.action_max.cpu().numpy()}")
+>>>>>>> Incoming (Background Agent changes)
     
     def _tokenize_actions(self, actions: torch.Tensor) -> torch.Tensor:
         """
@@ -508,16 +536,19 @@ class OpenVLAModel(nn.Module):
         self,
         image: Union[torch.Tensor, Dict[str, torch.Tensor]],
         instruction: str,
-        unnorm_key: Optional[str] = "bridge_orig",
+        unnorm_key: Optional[str] = None,  # Changed: None means use custom stats
         do_sample: bool = False,
     ) -> np.ndarray:
         """
         Predict action for a single observation with multi-view support.
         
+        FIX: Now uses custom 8-DOF action statistics from RoboFactory dataset
+        instead of relying on bridge_orig (7-DOF) statistics from pretrained model.
+        
         Args:
             image: Single image (C, H, W) or dict of multi-view images
             instruction: Language instruction
-            unnorm_key: Key for denormalization stats (default: bridge_orig)
+            unnorm_key: Key for denormalization stats (None = use custom stats)
             do_sample: Whether to sample or use greedy decoding
             
         Returns:
@@ -552,37 +583,49 @@ class OpenVLAModel(nn.Module):
             for k, v in inputs.items()
         }
         
-        # Generate action
+        # Generate action tokens
         with torch.no_grad():
             # Handle DDP wrapper
             model = self.model
             if hasattr(model, 'module'):
                 model = model.module
             
-            # Use the base model's predict_action which handles tokenization/detokenization
-            action = model.predict_action(**inputs, unnorm_key=unnorm_key, do_sample=do_sample)
-        
-        # Action from base model is typically 7-DOF (from bridge_orig)
-        # We need to ensure it's the correct dimension for our environment
-        action = np.array(action).flatten()
-        
-        # Pad or truncate to match expected action_dim (8 for Panda)
-        if len(action) < self.action_dim:
-            # Pad with zeros (e.g., add gripper=0 if missing)
-            padding = np.zeros(self.action_dim - len(action))
-            action = np.concatenate([action, padding])
-        elif len(action) > self.action_dim:
-            # Truncate to expected dimension
-            action = action[:self.action_dim]
-        
-        # Apply custom denormalization if statistics available and shapes match
-        if self.action_mean is not None and self.action_std is not None:
-            if action.shape[-1] == self.action_std.shape[-1]:
-                # Re-normalize with our dataset statistics
-                # Note: action from base model is already un-normalized with bridge_orig stats
-                # For proper handling, we'd need to re-normalize then un-normalize
-                # For now, we use the action as-is since it's already in a reasonable range
-                pass
+            # FIX: Generate raw action tokens without using bridge_orig denormalization
+            # We'll detokenize ourselves using our 8-DOF statistics
+            if self.action_min is not None and self.action_max is not None:
+                # Generate using base model but get raw token output
+                generated_ids = model.generate(
+                    input_ids=inputs.get('input_ids'),
+                    attention_mask=inputs.get('attention_mask', None),
+                    pixel_values=inputs.get('pixel_values'),
+                    max_new_tokens=self.action_dim,  # Generate exactly action_dim tokens
+                    do_sample=do_sample,
+                    temperature=1.0,
+                    pad_token_id=self.processor.tokenizer.pad_token_id,
+                )
+                
+                # Extract action tokens (last action_dim tokens)
+                action_tokens = generated_ids[0, -self.action_dim:]
+                
+                # Detokenize using our custom 8-DOF statistics
+                action_tensor = self._detokenize_actions(action_tokens)
+                action = action_tensor.cpu().numpy()
+            else:
+                # Fallback: use base model's predict_action with bridge_orig
+                # This path is for backward compatibility or if stats not set
+                action = model.predict_action(
+                    **inputs, 
+                    unnorm_key=unnorm_key or "bridge_orig", 
+                    do_sample=do_sample
+                )
+                action = np.array(action).flatten()
+                
+                # Pad or truncate to match expected action_dim (8 for Panda)
+                if len(action) < self.action_dim:
+                    padding = np.zeros(self.action_dim - len(action))
+                    action = np.concatenate([action, padding])
+                elif len(action) > self.action_dim:
+                    action = action[:self.action_dim]
         
         return action
     

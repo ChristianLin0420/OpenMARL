@@ -330,10 +330,61 @@ class Pi0Model(nn.Module):
             state_q01: 1st percentile of states
             state_q99: 99th percentile of states
         """
-        self.action_q01 = action_q01.to(self.device)
-        self.action_q99 = action_q99.to(self.device)
-        self.state_q01 = state_q01.to(self.device)
-        self.state_q99 = state_q99.to(self.device)
+<<<<<<< Current (Your changes)
+        # Convert to float32 to avoid dtype promotion issues with numpy-derived float64 tensors
+        self.action_q01 = action_q01.float().to(self.device)
+        self.action_q99 = action_q99.float().to(self.device)
+        self.state_q01 = state_q01.float().to(self.device)
+        self.state_q99 = state_q99.float().to(self.device)
+=======
+        # Convert to float32 and move to device
+        action_q01 = action_q01.float().to(self.device)
+        action_q99 = action_q99.float().to(self.device)
+        state_q01 = state_q01.float().to(self.device)
+        state_q99 = state_q99.float().to(self.device)
+        
+        # =====================================================================
+        # FIX: Handle dimension mismatch for checkpoints trained with wrong state dims
+        # Training data may have used 9-dim qpos (7 joints + 2 gripper fingers)
+        # But evaluation uses 8-dim state (7 joints + 1 gripper command)
+        # =====================================================================
+        if state_q01.shape[-1] != self.action_dim:
+            print(f"\n⚠️  WARNING: State statistics dimension mismatch!")
+            print(f"   Checkpoint has {state_q01.shape[-1]}-dim states, model expects {self.action_dim}-dim")
+            if state_q01.shape[-1] == 9 and self.action_dim == 8:
+                # Checkpoint trained with 9-dim qpos (7 joints + 2 gripper fingers)
+                # Truncate to 8-dim: keep 7 joints + average the 2 gripper values
+                print(f"   Applying fix: Using first 7 joints + average of last 2 gripper dims")
+                state_q01_fixed = torch.cat([
+                    state_q01[..., :7],  # 7 joints
+                    state_q01[..., 7:9].mean(dim=-1, keepdim=True)  # average gripper
+                ])
+                state_q99_fixed = torch.cat([
+                    state_q99[..., :7],  # 7 joints
+                    state_q99[..., 7:9].mean(dim=-1, keepdim=True)  # average gripper
+                ])
+                state_q01 = state_q01_fixed
+                state_q99 = state_q99_fixed
+                print(f"   ✓ Fixed: State statistics now {self.action_dim}-dim\n")
+            else:
+                # Other mismatch - just truncate
+                print(f"   Truncating to first {self.action_dim} dimensions\n")
+                state_q01 = state_q01[..., :self.action_dim]
+                state_q99 = state_q99[..., :self.action_dim]
+        
+        # Similar check for actions
+        if action_q01.shape[-1] != self.action_dim:
+            print(f"⚠️  WARNING: Action statistics dimension mismatch!")
+            print(f"   Checkpoint has {action_q01.shape[-1]}-dim actions, model expects {self.action_dim}-dim")
+            print(f"   Truncating to first {self.action_dim} dimensions\n")
+            action_q01 = action_q01[..., :self.action_dim]
+            action_q99 = action_q99[..., :self.action_dim]
+        
+        self.action_q01 = action_q01
+        self.action_q99 = action_q99
+        self.state_q01 = state_q01
+        self.state_q99 = state_q99
+>>>>>>> Incoming (Background Agent changes)
     
     def normalize_quantile(self, data: torch.Tensor, q01: torch.Tensor, q99: torch.Tensor) -> torch.Tensor:
         """Normalize data using quantile normalization (openpi convention)."""
@@ -381,9 +432,15 @@ class Pi0Model(nn.Module):
         pretrained_dim = 32
         is_pi05 = self.config.pi05
         
-        # Pad state from 8 -> 32 dimensions (ONLY for Pi0, not Pi0.5)
-        # Pi0.5 uses discrete state input which doesn't require padding
+        # =====================================================================
+        # FIX: Normalize state BEFORE padding (Pi0 only)
+        # Pi0.5 uses discrete state tokenization so skip normalization
+        # =====================================================================
         if not is_pi05:
+            # Normalize state using quantile normalization
+            state = self.normalize_quantile(state, self.state_q01, self.state_q99)
+            
+            # Pad state from 8 -> 32 dimensions
             current_state_dim = state.shape[-1]
             if current_state_dim < pretrained_dim:
                 state_padding = torch.zeros(
@@ -393,9 +450,14 @@ class Pi0Model(nn.Module):
                 )
                 state = torch.cat([state, state_padding], dim=-1)
         
-        # Pad actions from 8 -> 32 dimensions (required for BOTH Pi0 and Pi0.5)
-        # Actions are always processed through action_in_proj which expects 32 dims
+        # =====================================================================
+        # FIX: Normalize actions BEFORE padding (both Pi0 and Pi0.5)
+        # =====================================================================
         if actions is not None:
+            # Normalize actions using quantile normalization
+            actions = self.normalize_quantile(actions, self.action_q01, self.action_q99)
+            
+            # Pad actions from 8 -> 32 dimensions
             current_action_dim = actions.shape[-1]
             if current_action_dim < pretrained_dim:
                 action_padding = torch.zeros(
@@ -425,7 +487,7 @@ class Pi0Model(nn.Module):
         observation = SimpleNamespace(
             images=image,  # Dict of images (stay in float32 for OpenPI preprocessing)
             image_masks=image_mask,  # Dict of image masks
-            state=state,   # State tensor (converted to model dtype)
+            state=state,   # State tensor (now normalized for Pi0, unchanged for Pi0.5)
             tokenized_prompt=tokenized_prompt,  # Tokenized prompt tensor
             tokenized_prompt_mask=tokenized_prompt_mask,  # Attention mask for prompt
             token_ar_mask=token_ar_mask,  # Autoregressive mask for tokens
@@ -454,8 +516,14 @@ class Pi0Model(nn.Module):
             # Truncate actions from padded 32 dims back to actual action_dim
             # pred_actions shape: [batch, action_horizon, 32] -> [batch, action_horizon, action_dim]
             pred_actions = pred_actions[..., :self.action_dim]
+            
+            # =====================================================================
+            # FIX: Denormalize predicted actions back to original scale
+            # =====================================================================
+            pred_actions = self.denormalize_quantile(pred_actions, self.action_q01, self.action_q99)
+            
             return None, pred_actions
-    
+
     def compute_loss(self, batch: Dict) -> torch.Tensor:
         """
         Compute training loss.

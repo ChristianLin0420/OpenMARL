@@ -29,6 +29,9 @@ import hydra
 from omegaconf import DictConfig, OmegaConf
 import torch
 
+# Register custom resolvers
+OmegaConf.register_new_resolver("eval", eval, replace=True)
+
 
 @hydra.main(version_base=None, config_path="pi0_policy/config", config_name="robot_pi0")
 def main(cfg: DictConfig):
@@ -38,6 +41,9 @@ def main(cfg: DictConfig):
     Args:
         cfg: Hydra configuration loaded from YAML
     """
+    # Resolve config
+    OmegaConf.resolve(cfg)
+    
     # Print configuration
     if int(os.environ.get("RANK", 0)) == 0:
         print("="*80)
@@ -46,8 +52,11 @@ def main(cfg: DictConfig):
         print(OmegaConf.to_yaml(cfg))
         print("="*80)
     
-    # Instantiate workspace (Hydra will handle _target_ instantiation)
-    workspace = hydra.utils.instantiate(cfg, _recursive_=False)
+    # Import workspace directly instead of using Hydra instantiate
+    from pi0_policy.workspace.pi0_workspace import Pi0Workspace
+    
+    # Create workspace
+    workspace = Pi0Workspace(cfg)
     
     # Run training
     workspace.run()
