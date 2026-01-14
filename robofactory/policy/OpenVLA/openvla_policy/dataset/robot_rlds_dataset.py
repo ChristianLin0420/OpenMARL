@@ -473,14 +473,12 @@ class RobotRLDSDataset(BaseVLADataset):
                 self.statistics['proprio']['std']
             )
         
-        # Process action
+        # Process action - DO NOT normalize here, let the model handle tokenization
+        # FIX: Actions should be passed RAW to the model, which will handle
+        # normalization internally during tokenization (to avoid double normalization)
         action = step['action'].astype(np.float32)
-        if 'action' in self.statistics:
-            action = self._normalize(
-                action,
-                self.statistics['action']['mean'],
-                self.statistics['action']['std']
-            )
+        # NOTE: Normalization is now done in the model's _tokenize_actions()
+        # using action_min and action_max derived from dataset statistics
         
         return {
             'image': image_output,  # Dict[str, Tensor] or Tensor
