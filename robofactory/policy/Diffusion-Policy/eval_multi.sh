@@ -19,6 +19,7 @@ DEBUG_MODE="${4:-0}"
 TASK_NAME="${5:-$CONFIG_NAME}"
 MAX_STEPS="${6:-250}"
 NUM_EVAL="${7:-100}"
+START_SEED="${8:-1000}"
 
 # Automatically detect number of available GPUs
 if command -v nvidia-smi &> /dev/null; then
@@ -34,7 +35,6 @@ if [ "$NUM_GPUS" -lt 1 ]; then
     NUM_GPUS=1
 fi
 
-START_SEED=1000
 TOTAL_SEEDS=$NUM_EVAL
 
 # Cap NUM_GPUS to TOTAL_SEEDS (no point using more GPUs than seeds)

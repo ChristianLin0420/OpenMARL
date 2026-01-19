@@ -19,6 +19,7 @@ DEBUG_MODE="${4:-0}"
 TASK_NAME="${5:-$CONFIG_NAME}"
 MAX_STEPS="${6:-250}"
 NUM_EVAL="${7:-100}"
+START_SEED="${8:-1000}"
 
 # Automatically detect number of available GPUs
 if command -v nvidia-smi &> /dev/null; then
@@ -34,7 +35,6 @@ if [ "$NUM_GPUS" -lt 1 ]; then
     NUM_GPUS=1
 fi
 
-START_SEED=1000
 END_SEED=$((START_SEED + NUM_EVAL - 1))
 TOTAL_SEEDS=$NUM_EVAL
 
@@ -70,7 +70,8 @@ run_gpu_eval() {
         export DISPLAY=""
         
         # Run from robofactory directory (two levels up from script)
-        PYTHONPATH="$(pwd)/../..:$PYTHONPATH" CUDA_VISIBLE_DEVICES=$gpu_id OUTPUT=$(cd ../.. && python ./policy/OpenVLA/eval_multi_openvla.py \
+        # PYTHONPATH needs to be three levels up to reach /workspace (parent of robofactory)
+        PYTHONPATH="$(pwd)/../../..:$PYTHONPATH" CUDA_VISIBLE_DEVICES=$gpu_id OUTPUT=$(cd ../.. && python ./policy/OpenVLA/eval_multi_openvla.py \
             --config="$CONFIG_NAME" \
             --data_num=$DATA_NUM \
             --checkpoint_num=$CHECKPOINT_NUM \
@@ -78,11 +79,12 @@ run_gpu_eval() {
             --seed=$seed \
             --max_steps=$MAX_STEPS \
             --render_mode="rgb_array" \
-            --obs_mode="rgb")
+            --obs_mode="rgb" \
+            --record_dir="./eval_video/openvla/{env_id}" 2>&1)
         
-        LAST_LINE=$(echo "$OUTPUT" | tail -n 1)
         fine=0
-        if [[ $LAST_LINE == *"SUCCESS"* ]]; then
+        # Check for "SUCCESS" in the output (matching Python's print format)
+        if [[ $OUTPUT == *"SUCCESS"* ]]; then
             fine=1
             ((success++))
         fi

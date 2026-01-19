@@ -145,23 +145,38 @@ class OpenVLAPolicyWrapper(BasePolicyWrapper):
         self.data_num = data_num
         self.agent_id = agent_id
         
-        # Build checkpoint path
-        checkpoint_dir = f'checkpoints/{task_name}_Agent{agent_id}_{data_num}/epoch_{checkpoint_num}'
+        # Build checkpoint path (OpenVLA checkpoints don't have _{data_num} suffix)
+        checkpoint_dir = f'checkpoints/openvla/{task_name}_Agent{agent_id}/epoch_{checkpoint_num}'
         
         if not Path(checkpoint_dir).exists():
             raise FileNotFoundError(f"Checkpoint not found: {checkpoint_dir}")
         
-        # Load statistics
-        stats_path = f'data/rlds_data/{task_name}_Agent{agent_id}_{data_num}/statistics.json'
+        # Load action statistics from checkpoint's action_stats.json (preferred)
+        # This contains action_min/action_max needed for proper detokenization
         import json
-        if Path(stats_path).exists():
-            with open(stats_path, 'r') as f:
+        action_stats_path = f'checkpoints/openvla/{task_name}_Agent{agent_id}/action_stats.json'
+        if Path(action_stats_path).exists():
+            with open(action_stats_path, 'r') as f:
                 stats = json.load(f)
+            # action_stats.json has keys: action_mean, action_std, action_min, action_max
+            action_statistics = {
+                'mean': stats.get('action_mean'),
+                'std': stats.get('action_std'),
+                'min': stats.get('action_min'),
+                'max': stats.get('action_max'),
+            }
         else:
-            stats = None
+            # Fallback to RLDS statistics.json (may not have min/max)
+            stats_path = f'data/rlds_data/{task_name}_Agent{agent_id}/statistics.json'
+            if Path(stats_path).exists():
+                with open(stats_path, 'r') as f:
+                    stats = json.load(f)
+                action_statistics = stats.get('action')
+            else:
+                action_statistics = None
         
         # Load policy
-        self.load_policy(checkpoint_dir, action_statistics=stats.get('action') if stats else None)
+        self.load_policy(checkpoint_dir, action_statistics=action_statistics)
         
         # Get instruction
         self.instruction = load_task_instruction(task_name)
@@ -214,23 +229,24 @@ def main(args):
         human_render_camera_configs=dict(shader_pack='default'),
         viewer_camera_configs=dict(shader_pack='default'),
         num_envs=args.num_envs,
-        sim_backend='auto',
+        sim_backend='cpu',  # CPU backend required for RecordEpisodeMA video recording
         enable_shadow=True,
         parallel_in_single_scene=False,
     )
     
     env: BaseEnv = gym.make(env_id, **env_kwargs)
     
-    # Setup recording
+    # Setup recording - use unique directory per seed to avoid file locking conflicts
     record_dir = args.record_dir.format(env_id=env_id)
-    record_dir = f"{record_dir}/{args.seed}_{args.data_num}_{args.checkpoint_num}"
+    record_dir = f"{record_dir}/seed_{args.seed}"  # Match Pi0 naming convention
     if record_dir:
         env = RecordEpisodeMA(
             env,
-            record_dir,
+            output_dir=record_dir,
+            save_trajectory=True,
+            save_video=True,
             info_on_video=False,
-            save_trajectory=False,
-            max_steps_per_video=30000
+            max_steps_per_video=args.max_steps
         )
     
     # Reset environment

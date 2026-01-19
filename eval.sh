@@ -30,6 +30,9 @@ NUM_EVAL=16
 MAX_STEPS=1000
 ALL_TASKS=false
 RESULTS_DIR="evaluation_results"
+TOTAL_EVAL=0           # Total evaluations target (0 = single batch mode)
+BATCH_SIZE=16          # Evaluations per batch (GPU limited)
+EVAL_STATE_DIR="/tmp/openmarl_eval_state"  # State tracking directory
 
 # Policy name mapping (short name -> checkpoint folder name)
 get_policy_dir_name() {
@@ -85,6 +88,8 @@ show_help() {
     echo "  --seed          Starting seed for evaluation (default: 1000)"
     echo "  --max_steps     Maximum steps per episode (default: 250)"
     echo "  --results_dir   Results directory (default: evaluation_results)"
+    echo "  --total_eval    Total evaluations across batches (default: 0 = single batch)"
+    echo "  --batch_size    Evaluations per batch/run (default: 16)"
     echo "  --help          Show this help message"
     echo ""
     echo "Supported Policies:"
@@ -124,6 +129,8 @@ while [[ $# -gt 0 ]]; do
         --seed)        SEED_START="$2";     shift 2 ;;
         --max_steps)   MAX_STEPS="$2";      shift 2 ;;
         --results_dir) RESULTS_DIR="$2";    shift 2 ;;
+        --total_eval)  TOTAL_EVAL="$2";     shift 2 ;;
+        --batch_size)  BATCH_SIZE="$2";     shift 2 ;;
         --all_tasks)   ALL_TASKS=true;      shift ;;
         --help|-h)     show_help ;;
         *)
@@ -248,6 +255,165 @@ get_agent_count() {
 }
 
 #==============================================================================
+# Batch evaluation helper functions
+#==============================================================================
+
+# Get policy-specific result directory
+get_result_dir() {
+    local policy="$1"
+    local task="$2"
+    case "$policy" in
+        dp)      echo "policy/Diffusion-Policy/eval_results_${task}" ;;
+        openvla) echo "policy/OpenVLA/eval_results_${task}" ;;
+        pi0|pi05) echo "policy/Pi0/eval_results_${task}" ;;
+    esac
+}
+
+# Get policy-specific log file pattern
+get_log_pattern() {
+    local policy="$1"
+    local task="$2"
+    case "$policy" in
+        dp)      echo "policy/Diffusion-Policy/eval_results_diffusion_policy_${task}_*.log" ;;
+        openvla) echo "policy/OpenVLA/eval_results_openvla_${task}_*.log" ;;
+        pi0|pi05) echo "policy/Pi0/eval_results_${policy}_${task}_*.log" ;;
+    esac
+}
+
+# Aggregate results from all batches
+aggregate_results() {
+    local task="$1"
+    local result_dir="$2"
+    local final_log="${result_dir}/FINAL_${POLICY}_${task}.log"
+    
+    log "${BLUE}Aggregating results for $task...${NC}"
+    
+    # Combine all batch logs (extract only data lines with seed,success format)
+    cat ${result_dir}/batch_*.log 2>/dev/null | grep "^[0-9]" > "$final_log" || true
+    
+    # Calculate final stats
+    local total=$(wc -l < "$final_log" 2>/dev/null || echo 0)
+    local success=$(grep ", 1," "$final_log" 2>/dev/null | wc -l || echo 0)
+    
+    if [[ $total -gt 0 ]]; then
+        local rate=$(python3 -c "print(f'{$success / $total * 100:.2f}')" 2>/dev/null || echo "0")
+        log "${GREEN}========================================"
+        log "FINAL RESULTS: $task ($POLICY)"
+        log "Total: $total, Success: $success, Rate: $rate%"
+        log "========================================${NC}"
+        echo "# Final: Total=$total, Success=$success, Rate=$rate%" >> "$final_log"
+    fi
+}
+
+# Generic batch evaluation runner
+run_batch_eval() {
+    local task="$1"
+    local relative_config="$2"
+    local result_dir="$3"
+    local batch_evals="$4"
+    local current_seed="$5"
+    local batch_num="$6"
+    
+    case "$POLICY" in
+        dp)
+            bash policy/Diffusion-Policy/eval_multi.sh \
+                "$relative_config" \
+                "$DATA_NUM" \
+                "$CHECKPOINT_NUM" \
+                "$DEBUG_MODE" \
+                "$task" \
+                "$MAX_STEPS" \
+                "$batch_evals" \
+                "$current_seed"
+            ;;
+        openvla)
+            bash policy/OpenVLA/eval_multi.sh \
+                "$relative_config" \
+                "$DATA_NUM" \
+                "$CHECKPOINT_NUM" \
+                "$DEBUG_MODE" \
+                "$task" \
+                "$MAX_STEPS" \
+                "$batch_evals" \
+                "$current_seed"
+            ;;
+        pi0|pi05)
+            local config_name=$(basename "${relative_config}" .yaml)
+            bash policy/Pi0/eval_multi.sh \
+                "$config_name" \
+                "$POLICY" \
+                "$DATA_NUM" \
+                "$CHECKPOINT_NUM" \
+                "$DEBUG_MODE" \
+                "$task" \
+                "$MAX_STEPS" \
+                "$batch_evals" \
+                "$current_seed"
+            ;;
+    esac
+    
+    # Move log file to result directory with batch number
+    local log_pattern=$(get_log_pattern "$POLICY" "$task")
+    local latest_log=$(ls -t $log_pattern 2>/dev/null | head -1)
+    if [[ -n "$latest_log" ]]; then
+        mv "$latest_log" "${result_dir}/batch_${batch_num}.log"
+    fi
+}
+
+# Generic batch continuation logic
+eval_with_batches() {
+    local task="$1"
+    local relative_config="$2"
+    
+    mkdir -p "$EVAL_STATE_DIR"
+    local state_file="${EVAL_STATE_DIR}/eval_${POLICY}_${task}_${CHECKPOINT_NUM}.state"
+    local result_dir=$(get_result_dir "$POLICY" "$task")
+    mkdir -p "$result_dir"
+    
+    # Read current progress
+    local completed_evals=0
+    if [[ -f "$state_file" ]]; then
+        completed_evals=$(cat "$state_file")
+    fi
+    
+    # Check if already complete
+    if [[ $completed_evals -ge $TOTAL_EVAL ]]; then
+        log "${GREEN}✓ Already completed $TOTAL_EVAL evaluations for $task${NC}"
+        aggregate_results "$task" "$result_dir"
+        return 0
+    fi
+    
+    # Calculate this batch
+    local remaining=$((TOTAL_EVAL - completed_evals))
+    local batch_evals=$((remaining < BATCH_SIZE ? remaining : BATCH_SIZE))
+    local current_seed=$((SEED_START + completed_evals))
+    local batch_num=$((completed_evals / BATCH_SIZE))
+    local total_batches=$(( (TOTAL_EVAL + BATCH_SIZE - 1) / BATCH_SIZE ))
+    
+    log "  Mode: Batch continuation ($completed_evals/$TOTAL_EVAL done)"
+    log "  Batch: $((batch_num + 1)) of $total_batches"
+    log "  Seeds: $current_seed to $((current_seed + batch_evals - 1))"
+    
+    # Run this batch
+    run_batch_eval "$task" "$relative_config" "$result_dir" "$batch_evals" "$current_seed" "$batch_num"
+    
+    # Update state
+    echo $((completed_evals + batch_evals)) > "$state_file"
+    
+    # Check if more batches needed
+    local new_completed=$((completed_evals + batch_evals))
+    if [[ $new_completed -lt $TOTAL_EVAL ]]; then
+        log "${YELLOW}Batch complete. $((TOTAL_EVAL - new_completed)) evaluations remaining.${NC}"
+        log "${YELLOW}Run again to continue (or use SLURM requeue).${NC}"
+        return 2  # Special return code: more batches needed
+    else
+        log "${GREEN}✓ All $TOTAL_EVAL evaluations complete for $task!${NC}"
+        aggregate_results "$task" "$result_dir"
+        return 0
+    fi
+}
+
+#==============================================================================
 # Policy-specific evaluation functions
 #==============================================================================
 
@@ -260,7 +426,6 @@ eval_diffusion_policy() {
     log "  Task: ${task}"
     log "  Config: ${config}"
     log "  Checkpoint: ${CHECKPOINT_NUM}"
-    log "  Episodes: ${NUM_EVAL}"
     
     cd robofactory
     
@@ -276,14 +441,24 @@ eval_diffusion_policy() {
     # Use config path relative to robofactory
     local relative_config="${config#robofactory/}"
     
-    bash policy/Diffusion-Policy/eval_multi.sh \
-        "$relative_config" \
-        "$DATA_NUM" \
-        "$CHECKPOINT_NUM" \
-        "$DEBUG_MODE" \
-        "$task" \
-        "$MAX_STEPS" \
-        "$NUM_EVAL"
+    # Batch continuation mode
+    if [[ $TOTAL_EVAL -gt 0 ]]; then
+        eval_with_batches "$task" "$relative_config"
+        local ret=$?
+        cd ..
+        return $ret
+    else
+        log "  Episodes: ${NUM_EVAL}"
+        bash policy/Diffusion-Policy/eval_multi.sh \
+            "$relative_config" \
+            "$DATA_NUM" \
+            "$CHECKPOINT_NUM" \
+            "$DEBUG_MODE" \
+            "$task" \
+            "$MAX_STEPS" \
+            "$NUM_EVAL" \
+            "$SEED_START"
+    fi
     
     cd ..
 }
@@ -297,7 +472,6 @@ eval_openvla() {
     log "  Task: ${task}"
     log "  Config: ${config}"
     log "  Checkpoint: ${CHECKPOINT_NUM}"
-    log "  Episodes: ${NUM_EVAL}"
     
     cd robofactory
     
@@ -313,15 +487,24 @@ eval_openvla() {
     # Use config path relative to robofactory
     local relative_config="${config#robofactory/}"
     
-    # Call eval_multi.sh for parallel multi-GPU evaluation (same as Diffusion Policy)
-    bash policy/OpenVLA/eval_multi.sh \
-        "$relative_config" \
-        "$DATA_NUM" \
-        "$CHECKPOINT_NUM" \
-        "$DEBUG_MODE" \
-        "$task" \
-        "$MAX_STEPS" \
-        "$NUM_EVAL"
+    # Batch continuation mode
+    if [[ $TOTAL_EVAL -gt 0 ]]; then
+        eval_with_batches "$task" "$relative_config"
+        local ret=$?
+        cd ..
+        return $ret
+    else
+        log "  Episodes: ${NUM_EVAL}"
+        bash policy/OpenVLA/eval_multi.sh \
+            "$relative_config" \
+            "$DATA_NUM" \
+            "$CHECKPOINT_NUM" \
+            "$DEBUG_MODE" \
+            "$task" \
+            "$MAX_STEPS" \
+            "$NUM_EVAL" \
+            "$SEED_START"
+    fi
     
     cd ..
     return 0
@@ -336,7 +519,6 @@ eval_pi0() {
     log "  Task: ${task}"
     log "  Config: ${config}"
     log "  Checkpoint: ${CHECKPOINT_NUM}"
-    log "  Episodes: ${NUM_EVAL}"
     
     cd robofactory
     
@@ -352,21 +534,26 @@ eval_pi0() {
     # Use config path relative to robofactory
     local relative_config="${config#robofactory/}"
     
-    # Extract config base name (e.g., "lift_barrier" from "configs/table/lift_barrier.yaml")
-    local config_name=$(basename "${relative_config}" .yaml)
-    
-    # Call eval_multi.sh for parallel multi-GPU evaluation
-    # Arguments: <config_name> <policy_type> <data_num> <checkpoint_step> [debug_mode] [task_name] [max_steps] [num_eval]
-    bash policy/Pi0/eval_multi.sh \
-        "$config_name" \
-        "$POLICY" \
-        "$DATA_NUM" \
-        "$CHECKPOINT_NUM" \
-        "$DEBUG_MODE" \
-        "$task" \
-        "$MAX_STEPS" \
-        "$NUM_EVAL"
-    
+    # Batch continuation mode
+    if [[ $TOTAL_EVAL -gt 0 ]]; then
+        eval_with_batches "$task" "$relative_config"
+        local ret=$?
+        cd ..
+        return $ret
+    else
+        log "  Episodes: ${NUM_EVAL}"
+        local config_name=$(basename "${relative_config}" .yaml)
+        bash policy/Pi0/eval_multi.sh \
+            "$config_name" \
+            "$POLICY" \
+            "$DATA_NUM" \
+            "$CHECKPOINT_NUM" \
+            "$DEBUG_MODE" \
+            "$task" \
+            "$MAX_STEPS" \
+            "$NUM_EVAL" \
+            "$SEED_START"
+    fi
     
     cd ..
     return 0

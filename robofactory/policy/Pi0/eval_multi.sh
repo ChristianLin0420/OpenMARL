@@ -38,6 +38,7 @@ DEBUG_MODE="${5:-0}"
 TASK_NAME="${6:-${CONFIG_NAME}-rf}"
 MAX_STEPS="${7:-250}"
 NUM_EVAL="${8:-100}"
+START_SEED="${9:-1000}"
 
 # Validate policy type
 if [ "$POLICY_TYPE" != "pi0" ] && [ "$POLICY_TYPE" != "pi05" ]; then
@@ -59,7 +60,6 @@ if [ "$NUM_GPUS" -lt 1 ]; then
     NUM_GPUS=1
 fi
 
-START_SEED=1000
 END_SEED=$((START_SEED + NUM_EVAL - 1))
 TOTAL_SEEDS=$NUM_EVAL
 

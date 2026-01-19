@@ -330,13 +330,6 @@ class Pi0Model(nn.Module):
             state_q01: 1st percentile of states
             state_q99: 99th percentile of states
         """
-<<<<<<< Current (Your changes)
-        # Convert to float32 to avoid dtype promotion issues with numpy-derived float64 tensors
-        self.action_q01 = action_q01.float().to(self.device)
-        self.action_q99 = action_q99.float().to(self.device)
-        self.state_q01 = state_q01.float().to(self.device)
-        self.state_q99 = state_q99.float().to(self.device)
-=======
         # Convert to float32 and move to device
         action_q01 = action_q01.float().to(self.device)
         action_q99 = action_q99.float().to(self.device)
@@ -384,7 +377,6 @@ class Pi0Model(nn.Module):
         self.action_q99 = action_q99
         self.state_q01 = state_q01
         self.state_q99 = state_q99
->>>>>>> Incoming (Background Agent changes)
     
     def normalize_quantile(self, data: torch.Tensor, q01: torch.Tensor, q99: torch.Tensor) -> torch.Tensor:
         """Normalize data using quantile normalization (openpi convention)."""

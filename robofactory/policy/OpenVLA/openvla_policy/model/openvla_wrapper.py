@@ -187,13 +187,8 @@ class OpenVLAModel(nn.Module):
             print(f"Action statistics set: dim={self.action_dim}")
             print(f"  mean: {mean}")
             print(f"  std: {std}")
-<<<<<<< Current (Your changes)
             print(f"  min: {self.action_min.cpu().float().numpy()}")
             print(f"  max: {self.action_max.cpu().float().numpy()}")
-=======
-            print(f"  min: {self.action_min.cpu().numpy()}")
-            print(f"  max: {self.action_max.cpu().numpy()}")
->>>>>>> Incoming (Background Agent changes)
     
     def _tokenize_actions(self, actions: torch.Tensor) -> torch.Tensor:
         """
@@ -727,9 +722,14 @@ class OpenVLAModel(nn.Module):
         if os.path.exists(stats_path):
             with open(stats_path, 'r') as f:
                 stats = json.load(f)
+            # FIX: Also load action_min and action_max for proper detokenization
+            action_min = np.array(stats['action_min']) if 'action_min' in stats else None
+            action_max = np.array(stats['action_max']) if 'action_max' in stats else None
             wrapper.set_action_statistics(
                 np.array(stats['action_mean']),
-                np.array(stats['action_std'])
+                np.array(stats['action_std']),
+                action_min=action_min,
+                action_max=action_max,
             )
             wrapper.action_dim = stats.get('action_dim', 8)
         
