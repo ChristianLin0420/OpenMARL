@@ -245,7 +245,7 @@ def main(args):
             output_dir=record_dir,
             save_trajectory=True,
             save_video=True,
-            info_on_video=False,
+            info_on_video=True,  # Must be True for video recording (match Pi0)
             max_steps_per_video=args.max_steps
         )
     

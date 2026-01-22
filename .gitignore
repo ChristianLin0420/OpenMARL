@@ -72,3 +72,4 @@ auto.sh
 # Logs
 logs/
 wandb/
+*.state

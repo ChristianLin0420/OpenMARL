@@ -440,3 +440,14 @@ class RecordEpisodeMA(RecordEpisode):
                 )
         self._video_steps = 0
         self.render_images = []
+
+    def close(self):
+        """Close the environment and flush any pending video/trajectory."""
+        # Flush video before closing
+        if self.save_video and self.num_envs == 1:
+            self.flush_video()
+        # Flush trajectory
+        if self.save_trajectory and self._trajectory_buffer is not None:
+            self.flush_trajectory(env_idxs_to_flush=np.arange(self.num_envs))
+        # Close the underlying environment
+        super().close()

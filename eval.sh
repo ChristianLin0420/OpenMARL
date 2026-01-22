@@ -32,7 +32,6 @@ ALL_TASKS=false
 RESULTS_DIR="evaluation_results"
 TOTAL_EVAL=0           # Total evaluations target (0 = single batch mode)
 BATCH_SIZE=16          # Evaluations per batch (GPU limited)
-EVAL_STATE_DIR="/tmp/openmarl_eval_state"  # State tracking directory
 
 # Policy name mapping (short name -> checkpoint folder name)
 get_policy_dir_name() {
@@ -162,6 +161,9 @@ fi
 # Get script directory and change to it
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
+
+# State tracking directory (must be set after SCRIPT_DIR)
+EVAL_STATE_DIR="${SCRIPT_DIR}/robofactory/eval_state"
 
 # Log file for batch evaluation
 LOG_FILE="${RESULTS_DIR}/evaluation_$(date +%Y%m%d_%H%M%S).log"
