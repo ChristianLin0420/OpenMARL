@@ -393,10 +393,17 @@ class RecordEpisodeMA(RecordEpisode):
             ignore_empty_transition (bool): whether to ignore trajectories that did not have any actions
             save (bool): whether to save the video to disk
         """
+        # DEBUG: Print at entry
+        print(f"[DEBUG flush_video()] render_images count: {len(self.render_images)}, output_dir: {self.output_dir}")
+        
         if len(self.render_images) == 0:
+            print(f"[DEBUG flush_video()] SKIPPING - no render_images!")
             return
         if ignore_empty_transition and len(self.render_images) == 1:
+            print(f"[DEBUG flush_video()] SKIPPING - only 1 frame, ignoring empty transition")
             return
+        
+        print(f"[DEBUG flush_video()] SAVING video with {len(self.render_images)} frames")
         if save:
             self._video_id += 1
             if name is None:
@@ -443,6 +450,11 @@ class RecordEpisodeMA(RecordEpisode):
 
     def close(self):
         """Close the environment and flush any pending video/trajectory."""
+        # DEBUG: Print video recording status
+        print(f"[DEBUG RecordEpisodeMA.close()] save_video={self.save_video}, num_envs={self.num_envs}")
+        print(f"[DEBUG RecordEpisodeMA.close()] render_images count: {len(self.render_images)}")
+        print(f"[DEBUG RecordEpisodeMA.close()] output_dir: {self.output_dir}")
+        
         # Flush video before closing
         if self.save_video and self.num_envs == 1:
             self.flush_video()

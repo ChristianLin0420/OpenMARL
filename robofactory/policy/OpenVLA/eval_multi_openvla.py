@@ -236,21 +236,30 @@ def main(args):
     
     env: BaseEnv = gym.make(env_id, **env_kwargs)
     
-    # Setup recording - use unique directory per seed to avoid file locking conflicts
+    # Setup recording BEFORE reset
     record_dir = args.record_dir.format(env_id=env_id)
-    record_dir = f"{record_dir}/seed_{args.seed}"  # Match Pi0 naming convention
+    record_dir = f"{record_dir}/seed_{args.seed}"
     if record_dir:
         env = RecordEpisodeMA(
             env,
             output_dir=record_dir,
-            save_trajectory=True,
+            save_trajectory=True, 
             save_video=True,
-            info_on_video=True,  # Must be True for video recording (match Pi0)
+            info_on_video=True,
             max_steps_per_video=args.max_steps
         )
+        # DEBUG: Verify wrapper initialization
+        print(f"[DEBUG] RecordEpisodeMA created:")
+        print(f"[DEBUG]   save_video={env.save_video}, num_envs={env.num_envs}")
+        print(f"[DEBUG]   output_dir={env.output_dir}")
+        print(f"[DEBUG]   render_images initialized: {hasattr(env, 'render_images')}")
     
-    # Reset environment
+    # Reset environment after wrapping
     raw_obs, _ = env.reset(seed=args.seed)
+    
+    # DEBUG: Check state after reset
+    if record_dir:
+        print(f"[DEBUG] After reset: render_images count = {len(env.render_images)}")
     
     # Initialize motion planner
     planner = PandaArmMotionPlanningSolver(
@@ -372,6 +381,10 @@ def main(args):
                     ]
                 
                 observation, reward, terminated, truncated, info = env.step(true_action)
+                
+                # DEBUG: Check if frames are being captured (only print first few times)
+                if hasattr(env, 'render_images') and cnt <= 2 and j == 0 and i == 0:
+                    print(f"[DEBUG env.step()] render_images count after step: {len(env.render_images)}")
                 
                 if verbose:
                     env.render_human()

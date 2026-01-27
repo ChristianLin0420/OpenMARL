@@ -704,6 +704,7 @@ class OpenVLAModel(nn.Module):
         
         # Create wrapper instance
         wrapper = cls.__new__(cls)
+        nn.Module.__init__(wrapper)  # Must call nn.Module.__init__ before assigning modules
         wrapper.model = model
         wrapper.processor = processor
         wrapper.device = device

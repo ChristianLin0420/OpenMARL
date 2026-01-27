@@ -82,6 +82,11 @@ run_gpu_eval() {
             --obs_mode="rgb" \
             --record_dir="./eval_video/openvla/{env_id}" 2>&1)
         
+        # DEBUG: Print the full output to see debug messages
+        echo "=== GPU $gpu_id Seed $seed Output ===" >&2
+        echo "$OUTPUT" >&2
+        echo "=== End Output ===" >&2
+        
         fine=0
         # Check for "SUCCESS" in the output (matching Python's print format)
         if [[ $OUTPUT == *"SUCCESS"* ]]; then

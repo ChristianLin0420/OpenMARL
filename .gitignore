@@ -73,3 +73,6 @@ auto.sh
 logs/
 wandb/
 *.state
+
+# Claude code
+claude_auto_guideline.md
